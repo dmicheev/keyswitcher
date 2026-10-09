@@ -1,0 +1,6 @@
+# Rust build artifacts
+target/node_modules/
+.next/
+dist/
+build/
+*.log
