@@ -1,13 +1,19 @@
 //! Тестовая заглушка [`System`] — эмуляция ОС для unit-тестов ядра.
 //! Работает на любой платформе, не требует доступа к реальной клавиатуре.
 
-use crate::core::{ActiveWindow, Layout, System};
+use crate::engine::{ActiveWindow, Layout, System};
 
 pub struct StubSystem {
     stack: Vec<ActiveWindow>,
     current: Layout,
     /// Все попытки смены раскладки (для проверок в тестах).
     pub applied: Vec<Layout>,
+}
+
+impl Default for StubSystem {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StubSystem {
@@ -44,14 +50,6 @@ impl StubSystem {
         if index < self.stack.len() && index != self.stack.len() - 1 {
             let win = self.stack.remove(index);
             self.stack.push(win);
-        }
-    }
-
-    /// Возврат на предыдущее («предпоследнее») окно — как Alt+Tab назад.
-    pub fn pop_to_last_activated(&mut self) {
-        if self.stack.len() >= 2 {
-            let last = self.stack.remove(self.stack.len() - 2);
-            self.stack.push(last);
         }
     }
 

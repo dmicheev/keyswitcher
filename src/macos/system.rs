@@ -6,25 +6,67 @@
 //!   Для этого пользователю нужно выдать приложению разрешение
 //!   «Системные настройки → Конфиденциальность и безопасность → Доступность».
 //!   Без разрешения переключатель корректно деградирует до режима
-//!   «раскладка на уровне приложения» (как «Исключения по программе» в Punto Switcher).
+//!   «раскладка на уровне приложения».
 
-use cocoa::base::{id, nil};
-use cocoa::foundation::NSAutoreleasePool;
-use objc::runtime::BOOL;
+// Макросы objc 0.2 (msg_send!/class!) внутри используют cfg(feature = "cargo-clippy")
+// — на новых тулчейнах это даёт предупреждение unexpected_cfgs. Известная
+// особенность старого objc, глушим точечно.
+#![allow(unexpected_cfgs)]
+
+use core::ffi::c_char;
+use std::ptr;
+
+use objc::runtime::Object;
+// `sel`/`sel_impl` нужны самой развёртке макроса msg_send!.
 use objc::{class, msg_send, sel, sel_impl};
 
-use crate::core::{ActiveWindow, Layout, System};
+use crate::engine::{ActiveWindow, Layout, System};
 use crate::macos::ffi;
 
-/// Известные ID раскладок EN/RU, добавленных пользователем в системе.
+type Id = *mut Object;
+
+const NIL: Id = ptr::null_mut();
+
+/// RAII-обёртка над NSAutoreleasePool: drain при выходе из области видимости.
+pub(crate) struct AutoReleasePool(Id);
+
+impl AutoReleasePool {
+    pub(crate) fn new() -> Self {
+        // Safety: вызывается на main-потоке с живым AppKit-рантаймом.
+        AutoReleasePool(unsafe { msg_send![class!(NSAutoreleasePool), new] })
+    }
+}
+
+impl Drop for AutoReleasePool {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // Safety: объект создан нами в `new`.
+            unsafe {
+                let _: () = msg_send![self.0, drain];
+            }
+        }
+    }
+}
+
+/// Кандидаты-раскладки EN/RU из числа ВКЛЮЧЁННЫХ источников ввода.
+/// Хранится список: если выбор первого по какой-то причине не удался,
+/// переключатель пробует следующий.
 #[derive(Default)]
 struct KnownSources {
-    en_id: Option<String>,
-    ru_id: Option<String>,
+    en_ids: Vec<String>,
+    ru_ids: Vec<String>,
+    /// Итог сканирования уже записан в журнал (не спамим при повторных сканах).
+    reported: bool,
 }
 
 pub struct MacSystem {
     known: KnownSources,
+}
+
+impl Default for MacSystem {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MacSystem {
@@ -37,17 +79,51 @@ impl MacSystem {
     /// Инициализация NSApplication в режиме агента (без иконки в Dock).
     /// Должно вызываться на main-потоке до запуска цикла.
     pub fn setup_ns_application() {
+        let _pool = AutoReleasePool::new();
+        // NSApplicationActivationPolicyAccessory = 1 — агент без Dock-иконки.
         unsafe {
-            let _pool = NSAutoreleasePool::new(nil);
-            let app: id = msg_send![class!(NSApplication), sharedApplication];
-            // NSApplicationAccessory = 1 — агент без Dock-иконки.
-            let _: () = msg_send![app, setActivationPolicy: 1isize];
+            let app: Id = msg_send![class!(NSApplication), sharedApplication];
+            if app != NIL {
+                let _: () = msg_send![app, setActivationPolicy: 1isize];
+            }
+        }
+    }
+
+    /// Печатает включённые источники ввода и их классификацию (`--list-layouts`).
+    pub fn print_input_sources() {
+        println!("Включённые источники ввода (классификация переключателя):");
+        // Safety: CF-вызовы только на чтение.
+        unsafe {
+            let list = ffi::TISCreateInputSourceList(ptr::null(), 0);
+            if list.is_null() {
+                println!("  <не удалось получить список>");
+                return;
+            }
+            let count = ffi::CFArrayGetCount(list);
+            if count == 0 {
+                println!("  <список пуст>");
+            }
+            for i in 0..count {
+                let src = ffi::CFArrayGetValueAtIndex(list, i) as ffi::TISInputSourceRef;
+                if src.is_null() {
+                    continue;
+                }
+                let sid = ffi::input_source_id(src).unwrap_or_else(|| "<без ID>".into());
+                println!("  {:<45} {:?}", sid, Self::classify(&sid));
+            }
+            ffi::CFRelease(list as ffi::CFTypeRef);
         }
     }
 
     /// Классификация источника ввода по его ID.
     fn classify(id_str: &str) -> Layout {
         let s = id_str.to_ascii_lowercase();
+        // Управляем только клавиатурными раскладками; методы ввода
+        // (inputmode: CJK-режимы, палитры и т.п.) не трогаем — иначе,
+        // например, китайский режим "...ITABC" ложно классифицируется как EN.
+        if !s.contains("keylayout") {
+            return Layout::Other;
+        }
         if s.contains("russian") || s.contains("cyrillic") {
             Layout::Ru
         } else if s.contains(".us")
@@ -62,71 +138,91 @@ impl MacSystem {
         }
     }
 
-    /// Один раз сканирует список источников ввода системы и запоминает
-    /// подходящие ID английской и русской раскладок.
-    unsafe fn refresh_known_sources(&mut self) {
-        if self.known.en_id.is_some() && self.known.ru_id.is_some() {
+    /// Сканирует ВКЛЮЧЁННЫЕ источники ввода и собирает ID раскладок EN/RU.
+    /// Повторяется, пока не найдётся и та, и другая (пользователь может
+    /// добавить раскладку в настройках на горячую).
+    fn refresh_known_sources(&mut self) {
+        if !self.known.en_ids.is_empty() && !self.known.ru_ids.is_empty() {
             return;
         }
-        let list = ffi::TISCreateInputSourceList(core::ptr::null(), 1);
-        if list.is_null() {
-            return;
-        }
-        let count = ffi::CFArrayGetCount(list);
-        for i in 0..count {
-            let src = ffi::CFArrayGetValueAtIndex(list, i) as ffi::TISInputSourceRef;
-            if src.is_null() {
-                continue;
+        // Safety: Carbon/CF-вызовы, выполняются на main-потоке.
+        unsafe {
+            // allSources = 0: только включённые — выключенная раскладка
+            // (например, US при включённом ABC) не выбирается через TIS.
+            let list = ffi::TISCreateInputSourceList(ptr::null(), 0);
+            if list.is_null() {
+                return;
             }
-            let key = match ffi::string_to_cfstring(ffi::K_TIS_PROPERTY_ID) {
-                Some(k) => k,
-                None => continue,
-            };
-            let prop = ffi::TISGetInputSourceProperty(src, key);
-            let sid = if prop.is_null() {
-                None
-            } else {
-                ffi::cfstring_to_string(prop as ffi::CFStringRef)
-            };
-            ffi::CFRelease(key);
-            if let Some(sid) = sid {
-                match Self::classify(&sid) {
-                    Layout::En if self.known.en_id.is_none() => self.known.en_id = Some(sid),
-                    Layout::Ru if self.known.ru_id.is_none() => self.known.ru_id = Some(sid),
-                    _ => {}
+            let count = ffi::CFArrayGetCount(list);
+            for i in 0..count {
+                let src = ffi::CFArrayGetValueAtIndex(list, i) as ffi::TISInputSourceRef;
+                if src.is_null() {
+                    continue;
+                }
+                if let Some(sid) = ffi::input_source_id(src) {
+                    match Self::classify(&sid) {
+                        Layout::En if !self.known.en_ids.contains(&sid) => {
+                            self.known.en_ids.push(sid)
+                        }
+                        Layout::Ru if !self.known.ru_ids.contains(&sid) => {
+                            self.known.ru_ids.push(sid)
+                        }
+                        _ => {}
+                    }
                 }
             }
+            ffi::CFRelease(list as ffi::CFTypeRef);
         }
-        ffi::CFRelease(list as ffi::CFTypeRef);
+        if !self.known.reported {
+            self.known.reported = true;
+            log::info!(
+                "Включённые раскладки: EN={:?}, RU={:?}",
+                self.known.en_ids,
+                self.known.ru_ids
+            );
+            if self.known.en_ids.is_empty() {
+                log::warn!(
+                    "EN-раскладка не найдена среди включённых источников ввода \
+                     (System Settings → Keyboard → Input Sources)"
+                );
+            }
+            if self.known.ru_ids.is_empty() {
+                log::warn!("RU-раскладка не найдена среди включённых источников ввода");
+            }
+        }
     }
 
-    unsafe fn select_source_by_id(&self, source_id: &str) -> bool {
-        let Some((src, list)) = ffi::find_input_source(source_id) else {
-            return false;
-        };
-        let status = ffi::TISSelectInputSource(src);
-        ffi::CFRelease(list as ffi::CFTypeRef);
-        status == 0
+    fn select_source_by_id(&self, source_id: &str) -> bool {
+        // Safety: Carbon/CF-вызовы, выполняются на main-потоке.
+        unsafe {
+            let Some((src, list)) = ffi::find_input_source(source_id) else {
+                return false;
+            };
+            let status = ffi::TISSelectInputSource(src);
+            ffi::CFRelease(list as ffi::CFTypeRef);
+            status == 0
+        }
     }
 }
 
 impl System for MacSystem {
     fn active_window(&mut self) -> Option<ActiveWindow> {
+        let _pool = AutoReleasePool::new();
+        // Safety: AppKit-вызовы на main-потоке; указатели проверяются на nil/null.
         unsafe {
-            let _pool = NSAutoreleasePool::new(nil);
-
-            let ws: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let app: id = msg_send![ws, frontmostApplication];
-            if app == nil {
+            let ws: Id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            if ws == NIL {
                 return None;
             }
-            let bundle_id: id = msg_send![app, bundleIdentifier];
-            let name: id = msg_send![app, localizedName];
+            let app: Id = msg_send![ws, frontmostApplication];
+            if app == NIL {
+                return None;
+            }
+            let bundle_id: Id = msg_send![app, bundleIdentifier];
+            let name: Id = msg_send![app, localizedName];
 
-            let app_name = nsstring_to_rust(name)?.into_owned();
-            let app_id = nsstring_to_rust(bundle_id)
-                .map(|s| s.into_owned())
-                .unwrap_or_else(|| app_name.clone());
+            let app_name = nsstring_to_string(name)?;
+            let app_id = nsstring_to_string(bundle_id).unwrap_or_else(|| app_name.clone());
 
             let pid: i64 = msg_send![app, processIdentifier];
             let title = ax_bridge_title(pid);
@@ -140,8 +236,9 @@ impl System for MacSystem {
     }
 
     fn current_layout(&mut self) -> Layout {
+        self.refresh_known_sources();
+        // Safety: см. ffi::current_input_source_id.
         unsafe {
-            self.refresh_known_sources();
             match ffi::current_input_source_id() {
                 Some(id) => Self::classify(&id),
                 None => Layout::Other,
@@ -150,18 +247,15 @@ impl System for MacSystem {
     }
 
     fn set_layout(&mut self, layout: Layout) -> bool {
-        unsafe {
-            self.refresh_known_sources();
-            let target_id = match layout {
-                Layout::En => self.known.en_id.clone(),
-                Layout::Ru => self.known.ru_id.clone(),
-                Layout::Other => None,
-            };
-            match target_id {
-                Some(id) => self.select_source_by_id(&id),
-                None => false,
-            }
-        }
+        self.refresh_known_sources();
+        let candidates: &[String] = match layout {
+            Layout::En => &self.known.en_ids,
+            Layout::Ru => &self.known.ru_ids,
+            Layout::Other => &[],
+        };
+        // Пробуем кандидатов по очереди: первый может не выбраться
+        // (например, добавлен, но ещё не активирован).
+        candidates.iter().any(|id| self.select_source_by_id(id))
     }
 }
 
@@ -170,10 +264,11 @@ impl System for MacSystem {
 // ---------------------------------------------------------------------------
 extern "C" {
     /// Заголовок фокусного окна процесса `pid` (malloc'ная UTF-8 строка) или NULL.
-    fn ax_bridge_copy_title(pid: i32) -> *const std::os::raw::c_char;
-    fn ax_bridge_free(ptr: *const std::os::raw::c_char);
+    fn ax_bridge_copy_title(pid: i32) -> *const c_char;
+    fn ax_bridge_free(ptr: *const c_char);
 }
 
+/// # Safety: указатель из ax_bridge_copy_title валиден до ax_bridge_free.
 unsafe fn ax_bridge_title(pid: i64) -> Option<String> {
     let p = ax_bridge_copy_title(pid as i32);
     if p.is_null() {
@@ -181,24 +276,55 @@ unsafe fn ax_bridge_title(pid: i64) -> Option<String> {
     }
     let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
     ax_bridge_free(p);
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    (!s.is_empty()).then_some(s)
 }
 
-unsafe fn nsstring_to_rust<'a>(s: id) -> Option<std::borrow::Cow<'a, str>> {
-    if s == nil {
+/// # Safety: `s` должен быть валидным указателем на NSString или NULL.
+pub(crate) unsafe fn nsstring_to_string(s: Id) -> Option<String> {
+    if s.is_null() {
         return None;
     }
-    let utf8: *const std::os::raw::c_char = msg_send![s, UTF8String];
+    let utf8: *const c_char = msg_send![s, UTF8String];
     if utf8.is_null() {
         return None;
     }
-    Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy())
+    // Копируем в собственную строку: данные за указателем живут до drain пула.
+    Some(
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
-/// Маркер использования типа BOOL из objc-runtime (пригодится при расширении).
-#[allow(dead_code)]
-fn _bool_marker(_: BOOL) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_common_input_source_ids() {
+        assert_eq!(MacSystem::classify("com.apple.keylayout.ABC"), Layout::En);
+        assert_eq!(MacSystem::classify("com.apple.keylayout.US"), Layout::En);
+        assert_eq!(
+            MacSystem::classify("com.apple.keylayout.British-PC"),
+            Layout::En
+        );
+        assert_eq!(
+            MacSystem::classify("com.apple.keylayout.Russian"),
+            Layout::Ru
+        );
+        assert_eq!(
+            MacSystem::classify("com.apple.keylayout.RussianWin"),
+            Layout::Ru
+        );
+        // Методы ввода (не keylayout) не классифицируем — даже если в ID
+        // встречается "abc".
+        assert_eq!(
+            MacSystem::classify("com.apple.inputmode.SCIM.ITABC"),
+            Layout::Other
+        );
+        assert_eq!(
+            MacSystem::classify("com.apple.CharacterPaletteIM"),
+            Layout::Other
+        );
+    }
+}

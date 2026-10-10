@@ -1,13 +1,14 @@
-//! Точка входа PuntoSwitcher.
+//! Точка входа SmartSwitcher.
 //!
 //! * На macOS: основной цикл на main-потоке (NSAutoreleasePool внутри опросов),
 //!   периодическое определение активного окна и коррекция раскладки —
-//!   аналог «умного переключения под активное окно» из Punto Switcher.
+//!   аналог «умного переключения под активное окно» из Smart Switcher.
 //! * На других ОС: запускается демонстрационный режим на эмуляторе
 //!   (`src/stub.rs`), чтобы логику можно было проверить/протестировать где угодно.
 
 mod config;
-mod core;
+mod engine;
+#[cfg(any(test, not(target_os = "macos")))]
 mod stub;
 
 #[cfg(target_os = "macos")]
@@ -17,15 +18,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use config::Config;
-use core::{Action, Switcher, System};
+use engine::{Action, Switcher, System};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
 
-/// Период опроса активного окна (Punto Switcher тоже работает «с горячими клавишами»,
+/// Период опроса активного окна (Smart Switcher тоже работает «с горячими клавишами»,
 /// но базовый механизм — быстрый поллинг).
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Период горячей перезагрузки конфигурации.
+const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Флаг «работать дальше». Меняется обработчиком SIGINT/SIGTERM.
-static RUNNING: AtomicBool = AtomicBool::new(true);
+pub(crate) static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn on_term(_sig: i32) {
     // signal handler должен быть async-signal-safe: атомарная запись допустима.
@@ -48,16 +52,9 @@ fn install_signal_handlers() {
 #[cfg(not(unix))]
 fn install_signal_handlers() {}
 
-fn log_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    if cfg!(target_os = "macos") {
-        std::path::PathBuf::from(home)
-            .join("Library")
-            .join("Logs")
-            .join("puntoswicher.log")
-    } else {
-        std::path::PathBuf::from(home).join("puntoswicher.log")
-    }
+pub(crate) fn log_path() -> std::path::PathBuf {
+    // Журнал — рядом с программой (тот же каталог, что и config.txt).
+    config::base_dir().join("smartswitcher.log")
 }
 
 fn init_logging() {
@@ -70,27 +67,30 @@ fn init_logging() {
             let _ = WriteLogger::init(LevelFilter::Info, LogConfig::default(), file);
         }
         Err(_) => {
-            eprintln!("Не удалось создать журнал в {:?}, логирование в stderr", path);
+            eprintln!(
+                "Не удалось создать журнал в {:?}, логирование в stderr",
+                path
+            );
             let _ = simplelog::SimpleLogger::init(LevelFilter::Info, LogConfig::default());
         }
     }
 }
 
-/// Общий цикл: создаёт переключатель поверх конкретной реализации `System`
-/// и крутится до сигнала выхода. Компилируется на всех платформах.
+/// Общий цикл: крутит переключатель поверх конкретной реализации `System`
+/// до сигнала выхода. Компилируется на всех платформах.
 fn run_loop<S: System>(system: &mut S, config: Config) {
-    let mut switcher = Switcher::new(system, config);
+    let mut switcher = Switcher::new(config);
     let mut last_config_check = Instant::now();
     let config_path = Config::default_path();
 
     while RUNNING.load(Ordering::SeqCst) {
-        let action = switcher.step();
+        let action = switcher.step(system);
         if !matches!(action, Action::Nothing) {
             log::info!("{:?}", action);
         }
 
-        // Горячая перезагрузка конфигурации раз в 5 секунд.
-        if last_config_check.elapsed() > Duration::from_secs(5) {
+        // Горячая перезагрузка конфигурации.
+        if last_config_check.elapsed() > CONFIG_RELOAD_INTERVAL {
             last_config_check = Instant::now();
             if config_path.exists() {
                 let cfg = Config::load(&config_path);
@@ -104,8 +104,19 @@ fn run_loop<S: System>(system: &mut S, config: Config) {
 }
 
 fn main() {
-    if std::env::args().any(|a| a == "--help" || a == "-h") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
+        return;
+    }
+    if args
+        .iter()
+        .any(|a| a == "--list-layouts" || a == "--layouts")
+    {
+        #[cfg(target_os = "macos")]
+        macos::MacSystem::print_input_sources();
+        #[cfg(not(target_os = "macos"))]
+        eprintln!("Список раскладок доступен только на macOS.");
         return;
     }
 
@@ -124,9 +135,16 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     {
-        macos::MacSystem::setup_ns_application();
-        let mut system = macos::MacSystem::new();
-        run_loop(&mut system, config);
+        let headless = args.iter().any(|a| a == "--no-ui");
+        if headless {
+            // «Головой» режим: как раньше, цикл со sleep и без UI.
+            macos::MacSystem::setup_ns_application();
+            let mut system = macos::MacSystem::new();
+            run_loop(&mut system, config);
+        } else {
+            let system = macos::MacSystem::new();
+            macos::ui::run_ui(system, config);
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -144,16 +162,18 @@ fn main() {
 
 fn print_help() {
     println!(
-        "puntoswicher — автоматическая раскладка клавиатуры под активным окном\n\
-         (аналог Punto Switcher для macOS, на Rust)\n\n\
+        "smartswitcher — автоматическая раскладка клавиатуры под активным окном\n\
+         (Smart Switcher для macOS, на Rust)\n\n\
          Использование:\n  \
-         puntoswicher [--help]\n\n\
+         smartswitcher [--help] [--list-layouts] [--no-ui]\n\n\
          Конфигурация: {}\n\
          Журнал:       {}\n\n\
          Требуемые разрешения macOS:\n\
          \x20 • Доступность (System Settings → Privacy & Security → Accessibility)\n\
          \x20   — нужна для заголовков окон; без неё переключение работает на уровне приложений.\n\n\
-         Автозапуск: examples/com.puntoswicher.agent.plist (launchd)",
+         Переключение использует только ВКЛЮЧЁННЫЕ источники ввода\n\
+         \x20 (System Settings → Keyboard → Input Sources); список: --list-layouts\n\n\
+         Автозапуск: examples/com.smartswitcher.agent.plist (launchd)",
         Config::default_path().display(),
         log_path().display()
     );

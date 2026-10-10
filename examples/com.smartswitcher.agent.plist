@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Пример автозапуска SmartSwitcher через launchd (агент пользователя).
+
+  Установка:
+    1. make install   (бандл в /Applications/Smartswitcher.app)
+    2. cp examples/com.smartswitcher.agent.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.smartswitcher.agent.plist
+
+  Проверка/остановка:
+    launchctl list | grep smartswitcher
+    launchctl unload ~/Library/LaunchAgents/com.smartswitcher.agent.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ru.dimka.smartswitcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Smartswitcher.app/Contents/MacOS/smartswitcher</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Не перезапускать автоматически: агент держит собственный цикл
+         и корректно завершается по SIGINT/SIGTERM. -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

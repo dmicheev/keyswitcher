@@ -1,20 +1,19 @@
 [package]
-name = "puntoswicher"
+name = "smartswitcher"
 version = "0.1.0"
 edition = "2021"
-description = "Автоматическая смена раскладки клавиатуры под активным окном (аналог Punto Switcher для macOS)"
+description = "Автоматическая смена раскладки клавиатуры под активным окном (Smart Switcher для macOS)"
 
 [dependencies]
 log = "0.4"
 simplelog = { version = "0.12", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa = "0.26"
 objc = "0.2"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"
 
 [[bin]]
-name = "puntoswicher"
+name = "smartswitcher"
 path = "src/main.rs"
