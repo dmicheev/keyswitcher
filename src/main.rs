@@ -7,7 +7,11 @@
 //!   (`src/stub.rs`), чтобы логику можно было проверить/протестировать где угодно.
 
 mod config;
+mod dict;
 mod engine;
+mod keymap;
+mod ngram;
+mod predictor;
 #[cfg(any(test, not(target_os = "macos")))]
 mod stub;
 
@@ -15,11 +19,15 @@ mod stub;
 mod macos;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_os = "macos"))]
+use std::time::Instant;
 
 use config::Config;
-use engine::{Action, Switcher, System};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
+
+#[cfg(not(target_os = "macos"))]
+use engine::{Action, Switcher, System};
 
 /// Период опроса активного окна (Smart Switcher тоже работает «с горячими клавишами»,
 /// но базовый механизм — быстрый поллинг).
@@ -77,7 +85,10 @@ fn init_logging() {
 }
 
 /// Общий цикл: крутит переключатель поверх конкретной реализации `System`
-/// до сигнала выхода. Компилируется на всех платформах.
+/// до сигнала выхода. Используется на не-macOS (демо на заглушке);
+/// на macOS headless-режим работает на CFRunLoop (см. `macos/headless.rs`),
+/// чтобы на main run loop жил event tap режима печати.
+#[cfg(not(target_os = "macos"))]
 fn run_loop<S: System>(system: &mut S, config: Config) {
     let mut switcher = Switcher::new(config);
     let mut last_config_check = Instant::now();
@@ -125,6 +136,14 @@ fn main() {
 
     let config_path = Config::default_path();
     let config = Config::load(&config_path);
+    // Портативный режим: если конфига ещё нет — создаём с текущими
+    // значениями по умолчанию, чтобы его можно было править руками.
+    if !config_path.exists() {
+        match config.save(&config_path) {
+            Ok(()) => log::info!("Создан конфиг по умолчанию: {}", config_path.display()),
+            Err(e) => log::warn!("Не удалось создать конфиг {:?}: {}", config_path, e),
+        }
+    }
     log::info!(
         "Старт: auto_correct={}, default={:?}, idle={}s, исключений={}",
         config.auto_correct,
@@ -135,12 +154,19 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     {
+        // Прогрев словарей в фоне: к моменту установки тапа (после старта UI)
+        // они обычно уже загружены — меню не «замирает» на время разбора.
+        std::thread::spawn(|| {
+            predictor::LangPair::load_embedded();
+        });
+
         let headless = args.iter().any(|a| a == "--no-ui");
         if headless {
-            // «Головой» режим: как раньше, цикл со sleep и без UI.
+            // «Головой» режим: цикл на CFRunLoop (поллинг окна + event tap
+            // режима печати живут на main run loop), без UI.
             macos::MacSystem::setup_ns_application();
-            let mut system = macos::MacSystem::new();
-            run_loop(&mut system, config);
+            let system = macos::MacSystem::new();
+            macos::headless::run_headless(system, config);
         } else {
             let system = macos::MacSystem::new();
             macos::ui::run_ui(system, config);
@@ -162,18 +188,21 @@ fn main() {
 
 fn print_help() {
     println!(
-        "smartswitcher — автоматическая раскладка клавиатуры под активным окном\n\
-         (Smart Switcher для macOS, на Rust)\n\n\
-         Использование:\n  \
-         smartswitcher [--help] [--list-layouts] [--no-ui]\n\n\
-         Конфигурация: {}\n\
-         Журнал:       {}\n\n\
-         Требуемые разрешения macOS:\n\
-         \x20 • Доступность (System Settings → Privacy & Security → Accessibility)\n\
-         \x20   — нужна для заголовков окон; без неё переключение работает на уровне приложений.\n\n\
-         Переключение использует только ВКЛЮЧЁННЫЕ источники ввода\n\
-         \x20 (System Settings → Keyboard → Input Sources); список: --list-layouts\n\n\
-         Автозапуск: examples/com.smartswitcher.agent.plist (launchd)",
+        "smartswitcher — автоматическая раскладка клавиатуры под активное окно\n\
+          (Smart Switcher для macOS, на Rust)\n\n\
+          Использование:\n  \
+          smartswitcher [--help] [--list-layouts] [--no-ui]\n\n\
+          Конфигурация: {}\n\
+          Журнал:       {}\n\n\
+          Требуемые разрешения macOS:\n\
+          \x20 • Доступность (System Settings → Privacy & Security → Accessibility)\n\
+          \x20   — нужна для заголовков окон; без неё переключение работает на уровне приложений.\n\
+          \x20   — она же нужна режиму печати (CGEventTap); без неё функция отключается.\n\n\
+          Режим печати (typing_detect в config.txt): автопереключение EN<->RU по ходу\n\
+          набора + хоткей конвертации последнего слова (convert_hotkey, по умолчанию F13).\n\n\
+          Переключение использует только ВКЛЮЧЁННЫЕ источники ввода\n\
+          \x20 (System Settings → Keyboard → Input Sources); список: --list-layouts\n\n\
+          Автозапуск: examples/com.smartswitcher.agent.plist (launchd)",
         Config::default_path().display(),
         log_path().display()
     );

@@ -116,7 +116,7 @@ impl MacSystem {
     }
 
     /// Классификация источника ввода по его ID.
-    fn classify(id_str: &str) -> Layout {
+    pub(crate) fn classify(id_str: &str) -> Layout {
         let s = id_str.to_ascii_lowercase();
         // Управляем только клавиатурными раскладками; методы ввода
         // (inputmode: CJK-режимы, палитры и т.п.) не трогаем — иначе,

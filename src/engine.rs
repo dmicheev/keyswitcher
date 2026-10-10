@@ -249,6 +249,7 @@ mod tests {
             default_layout: DefaultLayout::En,
             idle_pause_seconds: 3600,
             excluded_apps: ["Terminal".into()].into_iter().collect(),
+            ..Config::default()
         }
     }
 

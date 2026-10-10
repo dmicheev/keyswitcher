@@ -15,7 +15,21 @@ DEBUG_BIN   := target/debug/$(BIN_NAME)
 BUNDLE_ROOT := build
 APP_BUNDLE  := $(BUNDLE_ROOT)/$(APP_NAME).app
 
-.PHONY: help build debug run lldb test fmt clippy check release bundle install uninstall run-bundle stop-bundle clean
+# Эталонный дефолтный конфиг. Полная пересборка/cargo clean стирает target/
+# целиком вместе с config.txt — при сборке копируем его обратно
+# (существующий файл НЕ затирается, чтобы не терять пользовательские правки).
+DEFAULT_CONFIG := assets/config.txt
+
+# Копирует дефолтный конфиг в каталог $(1), если его там ещё нет.
+define install-config
+@mkdir -p $(1)
+@if [ ! -f "$(1)/config.txt" ]; then \
+	cp "$(DEFAULT_CONFIG)" "$(1)/config.txt"; \
+	echo "конфиг: создан $(1)/config.txt"; \
+fi
+endef
+
+.PHONY: help build debug run lldb test fmt clippy check release bundle install uninstall run-bundle stop-bundle clean dicts config
 
 .DEFAULT_GOAL := help
 
@@ -26,11 +40,13 @@ help:
 	@echo "  make lldb         - запуск debug-версии под отладчиком lldb"
 	@echo "  make debug        - сборка debug + запуск (отладочный прогон)"
 	@echo "  make test         - unit-тесты (cargo test)"
+	@echo "  make dicts        - (пере)генерация словарей assets/lang/*.tsv (нужна сеть)"
 	@echo "  make fmt          - форматирование (cargo fmt)"
 	@echo "  make clippy       - линтер (cargo clippy)"
 	@echo "  make check        - fmt --check + clippy + тесты"
 	@echo "  make release      - релизная сборка (optimized)"
 	@echo "  make bundle       - релиз + самостоятельный $(APP_NAME).app (без консоли)"
+	@echo "  make config       - создать дефолтный config.txt в target/{debug,release} (если нет)"
 	@echo "  make install      - установка бандла в /Applications"
 	@echo "  make run-bundle   - запуск установленного/локального бандла (open)"
 	@echo "  make stop-bundle  - остановка запущенного агента"
@@ -39,6 +55,7 @@ help:
 
 build:
 	cargo build
+	$(call install-config,target/debug)
 
 run: build
 	./$(DEBUG_BIN)
@@ -52,6 +69,16 @@ debug: build
 test:
 	cargo test
 
+# Частотные словари для режима печати: скачивание FrequencyWords и
+# генерация assets/lang/{en,ru}.tsv (встраиваются в бинарник).
+dicts:
+	python3 tools/dict/prepare.py
+
+# Дефолтный конфиг в каталоги сборки (cargo clean мог их стереть).
+config:
+	$(call install-config,target/debug)
+	$(call install-config,target/release)
+
 fmt:
 	cargo fmt
 
@@ -62,6 +89,7 @@ check: ; cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo
 
 release:
 	cargo build --release
+	$(call install-config,target/release)
 
 # Самостоятельный .app-бандл: запускается через Finder/open без консоли.
 # LSUIElement — агент без иконки в Dock; логи пишутся в файл (см. README).
@@ -69,6 +97,10 @@ bundle: release
 	@rm -rf "$(APP_BUNDLE)"
 	@mkdir -p "$(APP_BUNDLE)/Contents/MacOS" "$(APP_BUNDLE)/Contents/Resources"
 	@cp "$(RELEASE_BIN)" "$(APP_BUNDLE)/Contents/MacOS/$(BIN_NAME)"
+	@if [ ! -f "$(APP_BUNDLE)/Contents/MacOS/config.txt" ]; then \
+		cp "$(DEFAULT_CONFIG)" "$(APP_BUNDLE)/Contents/MacOS/config.txt"; \
+		echo "конфиг: создан $(APP_BUNDLE)/Contents/MacOS/config.txt"; \
+	fi
 	@printf 'APPL????' > "$(APP_BUNDLE)/Contents/PkgInfo"
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n' > "$(APP_BUNDLE)/Contents/Info.plist"
 	@printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n' >> "$(APP_BUNDLE)/Contents/Info.plist"
