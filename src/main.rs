@@ -12,6 +12,7 @@ mod engine;
 mod keymap;
 mod ngram;
 mod predictor;
+mod spell;
 #[cfg(any(test, not(target_os = "macos")))]
 mod stub;
 

@@ -266,6 +266,44 @@ extern "C" {
     /// Заголовок фокусного окна процесса `pid` (malloc'ная UTF-8 строка) или NULL.
     fn ax_bridge_copy_title(pid: i32) -> *const c_char;
     fn ax_bridge_free(ptr: *const c_char);
+    /// Позиция указателя мыши в экранных координатах CG/AX.
+    fn ax_bridge_mouse_location(out_x: *mut f64, out_y: *mut f64) -> i32;
+    /// Геометрия дисплея с точкой + высота главного дисплея (для флипа Y).
+    fn ax_bridge_display_geometry(
+        px: f64,
+        py: f64,
+        out_flip_h: *mut f64,
+        out_dx: *mut f64,
+        out_dy: *mut f64,
+        out_dw: *mut f64,
+        out_dh: *mut f64,
+    ) -> i32;
+}
+
+/// Позиция указателя мыши `(x, y)` в «экранных» координатах CG/AX
+/// (origin — левый верхний угол главного монитора, y растёт вниз).
+/// `None` — получить не удалось (экзотика).
+pub(crate) fn ax_mouse_location() -> Option<(f64, f64)> {
+    let (mut x, mut y) = (0f64, 0f64);
+    // Safety: C-функция только пишет в переданные указатели.
+    let ok = unsafe { ax_bridge_mouse_location(&mut x, &mut y) };
+    (ok == 1).then_some((x, y))
+}
+
+/// Геометрия дисплеев для позиционирования попапа: `(flip_h, dx, dy, dw, dh)`.
+///
+/// `flip_h` — высота главного дисплея: перевод `y` из «экранных» координат
+/// AX (от верхнего края) в AppKit (от нижнего) всегда выполняется по нему,
+/// независимо от того, на каком дисплее находится точка. `(dx, dy, dw, dh)` —
+/// bounds дисплея, содержащего точку `(px, py)` (кламп панели).
+/// `None` — список дисплеев недоступен (экзотика).
+pub(crate) fn ax_display_geometry(px: f64, py: f64) -> Option<(f64, f64, f64, f64, f64)> {
+    let (mut flip_h, mut dx, mut dy, mut dw, mut dh) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    // Safety: C-функция только пишет в переданные указатели.
+    let ok = unsafe {
+        ax_bridge_display_geometry(px, py, &mut flip_h, &mut dx, &mut dy, &mut dw, &mut dh)
+    };
+    (ok == 1).then_some((flip_h, dx, dy, dw, dh))
 }
 
 /// # Safety: указатель из ax_bridge_copy_title валиден до ax_bridge_free.

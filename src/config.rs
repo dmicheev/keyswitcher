@@ -31,6 +31,15 @@
 //!
 //! # Горячая клавиша конвертации последнего слова: [mods+]key
 //! convert_hotkey = f13
+//!
+//! # Спеллчек-подсказки: попап с вариантами исправления по завершении слова
+//! spell_suggest = true
+//!
+//! # Минимальная длина слова для спеллчек-подсказок
+//! spell_min_chars = 4
+//!
+//! # Сколько вариантов исправления показывать (1..9)
+//! spell_max_suggestions = 5
 //! ```
 
 use std::collections::HashSet;
@@ -238,6 +247,12 @@ pub struct Config {
     pub retro_fix: bool,
     /// Горячая клавиша конвертации последнего слова.
     pub convert_hotkey: Hotkey,
+    /// Спеллчек-подсказки: попап с вариантами исправления по завершении слова.
+    pub spell_suggest: bool,
+    /// Минимальная длина слова для спеллчек-подсказок.
+    pub spell_min_chars: usize,
+    /// Сколько вариантов исправления показывать (1..9).
+    pub spell_max_suggestions: usize,
 }
 
 impl Default for Config {
@@ -252,6 +267,9 @@ impl Default for Config {
             switch_threshold: 100.0,
             retro_fix: true,
             convert_hotkey: Hotkey::default(),
+            spell_suggest: true,
+            spell_min_chars: 4,
+            spell_max_suggestions: 5,
         }
     }
 }
@@ -313,8 +331,15 @@ impl Config {
              switch_threshold = {}\n\n\
              # Исправлять уже набранный «неправильный» префикс слова\n\
              retro_fix = {}\n\n\
-             # Горячая клавиша конвертации последнего слова (например ctrl+shift+f13)\n\
-             convert_hotkey = {}\n",
+              # Горячая клавиша конвертации последнего слова (например ctrl+shift+f13)\n\
+              convert_hotkey = {}\n\n\
+              # Спеллчек-подсказки: после разделителя показывать попап с вариантами\n\
+              # исправления, если слово похоже на опечатку (клик или цифры 1-9)\n\
+              spell_suggest = {}\n\n\
+              # Минимальная длина слова для спеллчек-подсказок\n\
+              spell_min_chars = {}\n\n\
+              # Сколько вариантов исправления показывать (1..9)\n\
+              spell_max_suggestions = {}\n",
             self.auto_correct,
             default,
             self.idle_pause_seconds,
@@ -324,6 +349,9 @@ impl Config {
             self.switch_threshold,
             self.retro_fix,
             self.convert_hotkey.to_display_string(),
+            self.spell_suggest,
+            self.spell_min_chars,
+            self.spell_max_suggestions,
         )
     }
 
@@ -373,6 +401,13 @@ impl Config {
                     Some(h) => cfg.convert_hotkey = h,
                     None => log::warn!("Некорректный convert_hotkey '{}', оставлен прежний", value),
                 },
+                "spell_suggest" => cfg.spell_suggest = parse_bool(value),
+                "spell_min_chars" => {
+                    cfg.spell_min_chars = value.parse().unwrap_or(cfg.spell_min_chars)
+                }
+                "spell_max_suggestions" => {
+                    cfg.spell_max_suggestions = value.parse().unwrap_or(cfg.spell_max_suggestions)
+                }
                 other => log::warn!("Неизвестный параметр конфигурации: '{}'", other),
             }
         }
@@ -418,6 +453,24 @@ mod tests {
         assert_eq!(cfg.convert_hotkey, Hotkey::default());
         assert!(cfg.convert_hotkey.mods.option);
         assert!(cfg.convert_hotkey.is_mod_only());
+        // Спеллчек-подсказки включены по умолчанию.
+        assert!(cfg.spell_suggest);
+        assert_eq!(cfg.spell_min_chars, 4);
+        assert_eq!(cfg.spell_max_suggestions, 5);
+    }
+
+    #[test]
+    fn test_parse_spell_keys() {
+        let cfg = Config::parse(
+            "
+spell_suggest = false
+spell_min_chars = 6
+spell_max_suggestions = 3
+",
+        );
+        assert!(!cfg.spell_suggest);
+        assert_eq!(cfg.spell_min_chars, 6);
+        assert_eq!(cfg.spell_max_suggestions, 3);
     }
 
     #[test]
@@ -529,6 +582,9 @@ idle_pause_seconds = -5
         assert_eq!(parsed.switch_threshold, d.switch_threshold);
         assert_eq!(parsed.retro_fix, d.retro_fix);
         assert_eq!(parsed.convert_hotkey, d.convert_hotkey);
+        assert_eq!(parsed.spell_suggest, d.spell_suggest);
+        assert_eq!(parsed.spell_min_chars, d.spell_min_chars);
+        assert_eq!(parsed.spell_max_suggestions, d.spell_max_suggestions);
     }
 
     #[test]
@@ -545,6 +601,9 @@ idle_pause_seconds = -5
             switch_threshold: 55.5,
             retro_fix: false,
             convert_hotkey: Hotkey::parse("ctrl+shift+f13").unwrap(),
+            spell_suggest: false,
+            spell_min_chars: 5,
+            spell_max_suggestions: 7,
         };
         let reloaded = Config::parse(&original.to_file_string());
         assert_eq!(reloaded.auto_correct, original.auto_correct);
@@ -556,5 +615,11 @@ idle_pause_seconds = -5
         assert_eq!(reloaded.switch_threshold, original.switch_threshold);
         assert_eq!(reloaded.retro_fix, original.retro_fix);
         assert_eq!(reloaded.convert_hotkey, original.convert_hotkey);
+        assert_eq!(reloaded.spell_suggest, original.spell_suggest);
+        assert_eq!(reloaded.spell_min_chars, original.spell_min_chars);
+        assert_eq!(
+            reloaded.spell_max_suggestions,
+            original.spell_max_suggestions
+        );
     }
 }

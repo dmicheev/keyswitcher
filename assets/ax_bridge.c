@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 /* Таймаут обмена сообщениями с AX, сек. Защита от зависания на «глухих» приложениях. */
 static const double kAXTimeout = 0.25;
@@ -87,7 +88,81 @@ void ax_bridge_free(const char *ptr) {
     free((void *)ptr);
 }
 
+/*
+ * Текущая позиция указателя мыши в экранных координатах CG/AX
+ * (origin — левый верхний угол главного дисплея, y растёт вниз).
+ * Возвращает 1 и заполняет x/y, либо 0.
+ */
+int ax_bridge_mouse_location(double *out_x, double *out_y) {
+    if (out_x == NULL || out_y == NULL) {
+        return 0;
+    }
+    CGEventRef event = CGEventCreate(NULL);
+    if (event == NULL) {
+        return 0;
+    }
+    CGPoint p = CGEventGetLocation(event);
+    CFRelease(event);
+    *out_x = (double)p.x;
+    *out_y = (double)p.y;
+    return 1;
+}
+
 /* Проверка: выдано ли приложению право Accessibility. 1 — да. */
 int ax_bridge_is_trusted(void) {
     return AXIsProcessTrusted() ? 1 : 0;
+}
+
+/*
+ * Геометрия дисплеев в тех же «экранных» координатах AX/CG (origin — левый
+ * верхний угол ГЛАВНОГО дисплея, y растёт вниз; единицы — поинты).
+ * Находит дисплей, содержащий точку (px, py), и возвращает:
+ *   *out_flip_h — высота главного (primary) дисплея: по ней переводится y
+ *                 из AX (от верха) в AppKit (от низа) — для любой точки;
+ *   *out_dx..*out_dh — bounds найденного дисплея (кламп панели).
+ * 1 — успех, 0 — список дисплеев недоступен.
+ */
+#define MAX_DISPLAYS 16
+int ax_bridge_display_geometry(
+    double px, double py,
+    double *out_flip_h,
+    double *out_dx, double *out_dy, double *out_dw, double *out_dh) {
+    if (out_flip_h == NULL || out_dx == NULL || out_dy == NULL ||
+        out_dw == NULL || out_dh == NULL) {
+        return 0;
+    }
+    CGDirectDisplayID ids[MAX_DISPLAYS];
+    uint32_t count = 0;
+    if (CGGetActiveDisplayList(MAX_DISPLAYS, ids, &count) != kCGErrorSuccess ||
+        count == 0) {
+        return 0;
+    }
+
+    /* Главный дисплей — origin глобальных координат (0,0). */
+    CGRect primary = CGDisplayBounds(CGMainDisplayID());
+    *out_flip_h = (double)CGRectGetHeight(primary);
+
+    /* Дисплей, содержащий точку; иначе — ближайший по центрам. */
+    CGRect best = primary;
+    double best_dist = -1.0;
+    for (uint32_t i = 0; i < count; i++) {
+        CGRect b = CGDisplayBounds(ids[i]);
+        if (px >= CGRectGetMinX(b) && px <= CGRectGetMaxX(b) &&
+            py >= CGRectGetMinY(b) && py <= CGRectGetMaxY(b)) {
+            best = b;
+            break;
+        }
+        double cx = CGRectGetMidX(b) - px;
+        double cy = CGRectGetMidY(b) - py;
+        double dist = cx * cx + cy * cy;
+        if (best_dist < 0.0 || dist < best_dist) {
+            best = b;
+            best_dist = dist;
+        }
+    }
+    *out_dx = (double)CGRectGetMinX(best);
+    *out_dy = (double)CGRectGetMinY(best);
+    *out_dw = (double)CGRectGetWidth(best);
+    *out_dh = (double)CGRectGetHeight(best);
+    return 1;
 }

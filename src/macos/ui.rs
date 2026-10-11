@@ -85,6 +85,8 @@ struct SettingsUi {
     typing_check: Id,
     /// Чекбокс «ретро-фикс» (retro_fix).
     retro_check: Id,
+    /// Чекбокс «спеллчек-подсказки» (spell_suggest).
+    spell_check: Id,
 }
 
 /// Всё состояние агента; трогается только из main-потока (колбэки AppKit).
@@ -296,7 +298,7 @@ fn build_settings(controller: Id) -> SettingsUi {
         // Titled(1) | Closable(2), Buffered(2), defer = NO.
         let window: Id = msg_send![
             window,
-            initWithContentRect: rect(0.0, 0.0, 420.0, 315.0)
+            initWithContentRect: rect(0.0, 0.0, 420.0, 371.0)
             styleMask: 3u64
             backing: 2u64
             defer: 0i8
@@ -308,16 +310,16 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // Чекбокс «Автокоррекция».
         let check: Id = msg_send![class!(NSButton), alloc];
-        let check: Id = msg_send![check, initWithFrame: rect(20.0, 272.0, 380.0, 24.0)];
-        let _: () = msg_send![check, setButtonType: 4isize]; // NSButtonTypeSwitch
+        let check: Id = msg_send![check, initWithFrame: rect(20.0, 292.0, 380.0, 24.0)];
+        let _: () = msg_send![check, setButtonType: 3isize]; // NSButtonTypeSwitch (чекбокс)
         let _: () = msg_send![check, setTitle: nsstring("Автокоррекция раскладки")];
         let _: () = msg_send![content, addSubview: check];
 
         // Чекбокс «Автопереключение по печати» (typing_detect).
         let typing_check: Id = msg_send![class!(NSButton), alloc];
         let typing_check: Id =
-            msg_send![typing_check, initWithFrame: rect(20.0, 244.0, 380.0, 24.0)];
-        let _: () = msg_send![typing_check, setButtonType: 4isize];
+            msg_send![typing_check, initWithFrame: rect(20.0, 264.0, 380.0, 24.0)];
+        let _: () = msg_send![typing_check, setButtonType: 3isize]; // чекбокс
         let _: () = msg_send![
             typing_check,
             setTitle: nsstring("Автопереключение по ходу печати (Punto-стиль)")
@@ -326,21 +328,31 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // Чекбокс «Ретро-фикс».
         let retro_check: Id = msg_send![class!(NSButton), alloc];
-        let retro_check: Id = msg_send![retro_check, initWithFrame: rect(20.0, 216.0, 380.0, 24.0)];
-        let _: () = msg_send![retro_check, setButtonType: 4isize];
+        let retro_check: Id = msg_send![retro_check, initWithFrame: rect(20.0, 208.0, 380.0, 24.0)];
+        let _: () = msg_send![retro_check, setButtonType: 3isize]; // чекбокс
         let _: () = msg_send![
             retro_check,
             setTitle: nsstring("Исправлять уже набранный префикс слова")
         ];
         let _: () = msg_send![content, addSubview: retro_check];
 
+        // Чекбокс «Спеллчек-подсказки» (spell_suggest).
+        let spell_check: Id = msg_send![class!(NSButton), alloc];
+        let spell_check: Id = msg_send![spell_check, initWithFrame: rect(20.0, 236.0, 380.0, 24.0)];
+        let _: () = msg_send![spell_check, setButtonType: 3isize]; // чекбокс
+        let _: () = msg_send![
+            spell_check,
+            setTitle: nsstring("Подсказки исправления слов (спеллчек)")
+        ];
+        let _: () = msg_send![content, addSubview: spell_check];
+
         // «Раскладка по умолчанию».
-        let l1 = make_label(rect(20.0, 179.0, 205.0, 20.0), "Раскладка по умолчанию:");
+        let l1 = make_label(rect(20.0, 180.0, 205.0, 20.0), "Раскладка по умолчанию:");
         let _: () = msg_send![content, addSubview: l1];
         let popup: Id = msg_send![class!(NSPopUpButton), alloc];
         let popup: Id = msg_send![
             popup,
-            initWithFrame: rect(232.0, 175.0, 150.0, 27.0)
+            initWithFrame: rect(232.0, 176.0, 150.0, 27.0)
             pullsDown: 0i8
         ];
         for item in ["EN", "RU", "Не менять (keep)"] {
@@ -350,23 +362,26 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // «Время жизни состояния».
         let l2 = make_label(
-            rect(20.0, 139.0, 205.0, 20.0),
+            rect(20.0, 140.0, 205.0, 20.0),
             "Время жизни состояния, сек:",
         );
         let _: () = msg_send![content, addSubview: l2];
-        let idle = make_field(rect(232.0, 136.0, 80.0, 24.0));
+        let idle = make_field(rect(232.0, 137.0, 80.0, 24.0));
         let _: () = msg_send![content, addSubview: idle];
 
         // «Исключения».
-        let l3 = make_label(rect(20.0, 99.0, 205.0, 20.0), "Исключения (через запятую):");
+        let l3 = make_label(
+            rect(20.0, 100.0, 205.0, 20.0),
+            "Исключения (через запятую):",
+        );
         let _: () = msg_send![content, addSubview: l3];
-        let excl = make_field(rect(232.0, 96.0, 168.0, 24.0));
+        let excl = make_field(rect(232.0, 97.0, 168.0, 24.0));
         let _: () = msg_send![excl, setPlaceholderString: nsstring("Terminal, 1Password")];
         let _: () = msg_send![content, addSubview: excl];
 
         // Подсказка про остальные ключи режима печати.
         let l4 = make_label(
-            rect(20.0, 64.0, 390.0, 40.0),
+            rect(20.0, 55.0, 390.0, 36.0),
             "Хоткей конвертации и пороги — в config.txt (convert_hotkey, min_prefix_chars, switch_threshold)",
         );
         let _: () = msg_send![content, addSubview: l4];
@@ -388,6 +403,7 @@ fn build_settings(controller: Id) -> SettingsUi {
             exclude_field: excl,
             typing_check,
             retro_check,
+            spell_check,
         }
     }
 }
@@ -418,6 +434,7 @@ fn fill_settings(s: &SettingsUi, cfg: &Config) {
         let _: () = msg_send![s.auto_check, setState: cfg.auto_correct as isize];
         let _: () = msg_send![s.typing_check, setState: cfg.typing_detect as isize];
         let _: () = msg_send![s.retro_check, setState: cfg.retro_fix as isize];
+        let _: () = msg_send![s.spell_check, setState: cfg.spell_suggest as isize];
         let idx = match cfg.default_layout {
             DefaultLayout::En => 0,
             DefaultLayout::Ru => 1,
@@ -446,6 +463,7 @@ fn read_settings(s: &SettingsUi, base: &Config) -> Config {
         let excl = nsstring_to_string(excl).unwrap_or_default();
         let typing: isize = msg_send![s.typing_check, state];
         let retro: isize = msg_send![s.retro_check, state];
+        let spell: isize = msg_send![s.spell_check, state];
 
         Config {
             auto_correct: on == 1,
@@ -463,6 +481,7 @@ fn read_settings(s: &SettingsUi, base: &Config) -> Config {
                 .collect(),
             typing_detect: typing == 1,
             retro_fix: retro == 1,
+            spell_suggest: spell == 1,
             ..base.clone()
         }
     }

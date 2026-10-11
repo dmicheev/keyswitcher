@@ -152,6 +152,22 @@ pub struct Conversion {
     pub text: String,
 }
 
+/// Слово, зафиксированное по разделителю (для спеллчек-подсказок).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedWord {
+    /// Слово в EN-раскладке (`None`, если не все клавиши буквенные в ней).
+    pub view_en: Option<String>,
+    /// Слово в RU-раскладке.
+    pub view_ru: Option<String>,
+    /// Сколько символов набрано (backspace × k для исправления).
+    pub typed: usize,
+    /// Разделитель-клавиша (space/enter/tab), завершившая слово;
+    /// `None` — слово оборвано цифрой/пунктуацией/паузой.
+    pub sep: Option<char>,
+    /// Слово уже исправлено автопереключением — подсказки не нужны.
+    pub auto_switched: bool,
+}
+
 /// Стейт-машина текущего слова.
 pub struct Predictor {
     langs: Arc<LangPair>,
@@ -162,6 +178,8 @@ pub struct Predictor {
     last_word: Option<Vec<KeyPress>>,
     /// Разделитель, завершивший последнее слово (' ', '\n', '\t').
     last_sep: char,
+    /// Зафиксированное слово, ожидающее обработки спеллчеком.
+    pending: Option<CommittedWord>,
     /// Сработало ли автопереключение в текущем слове (гистерезис).
     switched: bool,
     last_event: Option<Instant>,
@@ -175,14 +193,25 @@ impl Predictor {
             buffer: Vec::new(),
             last_word: None,
             last_sep: ' ',
+            pending: None,
             switched: false,
             last_event: None,
         }
     }
 
+    /// Языковые модели (для спеллчека и других потребителей).
+    pub fn langs(&self) -> &Arc<LangPair> {
+        &self.langs
+    }
+
     /// Обновляет настройки (горячая перезагрузка конфига).
     pub fn update_config(&mut self, cfg: PredictorConfig) {
         self.cfg = cfg;
+    }
+
+    /// Забирает зафиксированное слово для спеллчека (одноразово).
+    pub fn take_committed(&mut self) -> Option<CommittedWord> {
+        self.pending.take()
     }
 
     /// Сбрасывает текущее слово (смена приложения, модификаторы, пауза...).
@@ -194,6 +223,7 @@ impl Predictor {
     pub fn forget_last(&mut self) {
         self.buffer.clear();
         self.last_word = None;
+        self.pending = None;
         self.switched = false;
     }
 
@@ -223,7 +253,10 @@ impl Predictor {
         self.last_event = Some(now);
 
         let Some((en, ru)) = keymap.chars_for(keycode, shift) else {
-            self.commit(); // функциональная клавиша — граница слова
+            // Функциональная клавиша — граница слова; реальные разделители
+            // (space/enter/tab) отмечаем для спеллчек-подсказок.
+            let sep = is_separator_key(keycode).then(|| sep_char(keycode));
+            self.commit_with_sep(sep);
             return Decision::None;
         };
         let current_char = match current_layout {
@@ -241,8 +274,9 @@ impl Predictor {
         };
 
         if !is_word_char(current_char) {
-            // Цифра/пунктуация в текущей раскладке — слово закончилось.
-            self.commit_with_sep(sep_char(keycode));
+            // Цифра/пунктуация в текущей раскладке — слово закончилось;
+            // для спеллчек-подсказок это не «настоящий» разделитель.
+            self.commit_with_sep(None);
             return Decision::None;
         }
 
@@ -326,34 +360,26 @@ impl Predictor {
     /// Слово в заданной раскладке (с сохранением регистра) — `None`, если
     /// хоть одна клавиша не отображается в буквенный символ этой раскладки.
     fn view(&self, layout: Layout) -> Option<String> {
-        let mut out = String::with_capacity(self.buffer.len());
-        for kp in &self.buffer {
-            let c = match layout {
-                Layout::En => kp.en,
-                Layout::Ru => kp.ru,
-                Layout::Other => None,
-            }?;
-            if !is_word_char(c) {
-                return None;
-            }
-            out.push(c);
-        }
-        (!out.is_empty()).then_some(out)
+        view_of(&self.buffer, layout)
     }
 
     /// Фиксирует текущее слово как «последнее» (для хоткея) и очищает буфер.
     fn commit(&mut self) {
-        if !self.buffer.is_empty() {
-            self.last_word = Some(std::mem::take(&mut self.buffer));
-            self.last_sep = ' ';
-        }
-        self.switched = false;
+        self.commit_with_sep(None);
     }
 
-    fn commit_with_sep(&mut self, sep: char) {
+    fn commit_with_sep(&mut self, sep: Option<char>) {
         if !self.buffer.is_empty() {
-            self.last_word = Some(std::mem::take(&mut self.buffer));
-            self.last_sep = sep;
+            let word = std::mem::take(&mut self.buffer);
+            self.last_sep = sep.unwrap_or(' ');
+            self.pending = Some(CommittedWord {
+                view_en: view_of(&word, Layout::En),
+                view_ru: view_of(&word, Layout::Ru),
+                typed: word.len(),
+                sep,
+                auto_switched: self.switched,
+            });
+            self.last_word = Some(word);
         }
         self.switched = false;
     }
@@ -411,6 +437,32 @@ fn sep_char(keycode: u8) -> char {
         crate::keymap::codes::TAB => '\t',
         _ => ' ',
     }
+}
+
+/// Клавиша-разделитель, завершающая слово «настоящим» пробелом/enter/tab.
+fn is_separator_key(keycode: u8) -> bool {
+    matches!(
+        keycode,
+        crate::keymap::codes::SPACE | crate::keymap::codes::RETURN | crate::keymap::codes::TAB
+    )
+}
+
+/// Слово из нажатых клавиш в заданной раскладке (`None`, если хоть одна
+/// клавиша не отображается в буквенный символ этой раскладки).
+fn view_of(word: &[KeyPress], layout: Layout) -> Option<String> {
+    let mut out = String::with_capacity(word.len());
+    for kp in word {
+        let c = match layout {
+            Layout::En => kp.en,
+            Layout::Ru => kp.ru,
+            Layout::Other => None,
+        }?;
+        if !is_word_char(c) {
+            return None;
+        }
+        out.push(c);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]
@@ -732,6 +784,85 @@ mod tests {
     fn nothing_to_convert() {
         let p = pred(PredictorConfig::default());
         assert_eq!(p.convert_last_word(Layout::En), None);
+    }
+
+    #[test]
+    fn committed_word_after_separator() {
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        type_word(
+            &mut p,
+            "ghbdtn",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        now += Duration::from_millis(50);
+        p.feed_key(
+            crate::keymap::codes::SPACE,
+            false,
+            Layout::En,
+            false,
+            &StaticKeymap,
+            now,
+        );
+        let c = p.take_committed().expect("слово зафиксировано");
+        assert_eq!(c.view_en.as_deref(), Some("ghbdtn"));
+        assert_eq!(c.view_ru.as_deref(), Some("привет"));
+        assert_eq!(c.typed, 6);
+        assert_eq!(c.sep, Some(' '));
+        assert!(!c.auto_switched);
+        assert!(p.take_committed().is_none(), "одноразово");
+    }
+
+    #[test]
+    fn committed_word_marks_autoswitch() {
+        let mut p = pred(PredictorConfig::default());
+        let mut now = t0();
+        // «ghbdtn» в EN -> автопереключение на RU, затем пробел.
+        type_word(
+            &mut p,
+            "ghbdtn",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        now += Duration::from_millis(50);
+        p.feed_key(
+            crate::keymap::codes::SPACE,
+            false,
+            Layout::Ru,
+            false,
+            &StaticKeymap,
+            now,
+        );
+        let c = p.take_committed().expect("слово зафиксировано");
+        assert!(c.auto_switched, "слово уже исправлено автопереключением");
+    }
+
+    #[test]
+    fn committed_word_digit_is_not_separator() {
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        type_word(
+            &mut p,
+            "ghb",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        now += Duration::from_millis(50);
+        p.feed_key(0x12, false, Layout::En, false, &StaticKeymap, now); // '1'
+        let c = p.take_committed().expect("слово зафиксировано цифрой");
+        assert_eq!(c.sep, None, "цифра — не разделитель для подсказок");
+        // Хоткей-конвертация по-прежнему считает разделителем пробел.
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 4,
+                text: "при ".into()
+            })
+        );
     }
 
     #[test]

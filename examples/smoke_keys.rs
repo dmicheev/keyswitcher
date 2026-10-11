@@ -72,7 +72,8 @@ mod smoke {
     }
 
     /// Разбор строки: слова из букв (последовательности клавиш) и
-    /// специальные токены `f13`, разделённые запятой: `the,f13`.
+    /// специальные токены `f13`, `sp` (пробел), разделённые запятой:
+    /// `the,f13`, `helo,sp`.
     fn parse_keys(s: &str) -> Vec<u16> {
         const F_KEYS: [u16; 19] = [
             0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F, 0x69, 0x6B,
@@ -87,6 +88,10 @@ mod smoke {
                         continue;
                     }
                 }
+            }
+            if token == "sp" {
+                out.push(0x31); // Space
+                continue;
             }
             for c in token.chars() {
                 match keycode_of(c) {

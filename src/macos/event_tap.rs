@@ -1,11 +1,15 @@
-//! Конвейер режима печати: event tap, предиктор, ретро-фикс и хоткей.
+//! Конвейер режима печати: event tap, предиктор, ретро-фикс, хоткей
+//! и спеллчек-подсказки (попап у каретки).
 //!
 //! [`TypingPipeline`] ставит на main run loop активный CGEventTap
 //! (keyDown + flagsChanged), пропускает события через [`Predictor`] и при
 //! уверенном определении языка переключает раскладку с исправлением уже
 //! набранного префикса (backspace × k + unicode-событие). Отдельно
 //! обрабатывается горячая клавиша конвертации последнего слова — она
-//! работает и при выключенном `typing_detect`.
+//! работает и при выключенном `typing_detect`. По завершении слова
+//! разделителем (пробел) неизвестное слово проверяется спеллчеком
+//! ([`crate::spell`]) и при наличии вариантов показывается попап
+//! [`SuggestPanel`]: цифры 1–9 применяют вариант, Esc закрывает.
 //!
 //! Свойства:
 //! * свои пост-события пропускаются по `kCGEventSourceStateID != HID(1)`;
@@ -14,23 +18,38 @@
 //!   (ре-включение тапа, ничего не переключаем);
 //! * приложения из `exclude_apps` и собственное окно настроек не трогаем.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::{Config, Hotkey, HotkeyMods};
 use crate::engine::{Layout, System};
 use crate::keymap::codes;
 use crate::macos::ffi;
 use crate::macos::keymap::RuntimeKeymap;
+use crate::macos::suggest_panel::SuggestPanel;
 use crate::macos::system::MacSystem;
-use crate::predictor::{Decision, Predictor, PredictorConfig};
+use crate::predictor::{CommittedWord, Decision, Predictor, PredictorConfig};
+use crate::spell::{self, SpellConfig, SuggestionKind};
 
 /// Маска событий тапа: keyDown + flagsChanged.
 const TAP_MASK: ffi::CGEventMask =
     (1 << ffi::KCG_EVENT_KEY_DOWN as u64) | (1 << ffi::KCG_EVENT_FLAGS_CHANGED as u64);
 /// Лимит UTF-16-единиц на одно unicode-событие (поле события ограничено ~20).
 const UNICODE_CHUNK: usize = 20;
+/// Время жизни попапа подсказок без взаимодействия.
+const SUGGEST_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Режим печати: тап + предиктор + постинг событий.
+/// «Рецепт» применения варианта исправления.
+#[derive(Debug, Clone)]
+struct SuggestFix {
+    /// Сколько backspace нажать (слово + разделитель).
+    backspaces: usize,
+    /// Что ввести (исправление + разделитель).
+    text: String,
+    /// Целевая раскладка для варианта-конвертации (`None` — не переключать).
+    layout: Option<Layout>,
+}
+
+/// Режим печати: тап + предиктор + постинг событий + попап подсказок.
 pub struct TypingPipeline {
     predictor: Predictor,
     keymap: RuntimeKeymap,
@@ -39,6 +58,18 @@ pub struct TypingPipeline {
     typing_detect: bool,
     retro_fix: bool,
     hotkey: Hotkey,
+    /// Настройки спеллчека (проекция конфигурации).
+    spell: SpellConfig,
+    /// Попап подсказок (создаётся вместе с конвейером, скрыт).
+    suggest_panel: SuggestPanel,
+    /// «Рецепты» исправлений для показанного попапа.
+    pending_fixes: Vec<SuggestFix>,
+    /// Зеркало видимости попапа (тап и AppKit живут на main run loop).
+    panel_visible: bool,
+    /// Когда показан попап (таймаут).
+    panel_shown_at: Option<Instant>,
+    /// Приложение, для которого показан попап (скрытие при смене).
+    panel_app: Option<(String, String)>,
     /// CGEventSource для наших пост-событий (CombinedSessionState).
     posting_source: ffi::CGEventSourceRef,
     /// Порт тапа (для ре-включения после DisabledByTimeout).
@@ -82,6 +113,12 @@ impl TypingPipeline {
             typing_detect: config.typing_detect,
             retro_fix: config.retro_fix,
             hotkey: config.convert_hotkey,
+            spell: spell_cfg(config),
+            suggest_panel: SuggestPanel::new(),
+            pending_fixes: Vec::new(),
+            panel_visible: false,
+            panel_shown_at: None,
+            panel_app: None,
             posting_source,
             tap_port: core::ptr::null_mut(),
             tap_source: core::ptr::null_mut(),
@@ -93,6 +130,10 @@ impl TypingPipeline {
                 .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())),
             mod_tap_armed: false,
         });
+        // Клик по кнопке попапа должен попасть в конвейер: адрес аллокации
+        // Box стабилен, пока конвейер жив.
+        let pipe_ptr: *mut TypingPipeline = pipeline.as_mut();
+        pipeline.suggest_panel.set_pipe(pipe_ptr);
         let user_info: *mut TypingPipeline = pipeline.as_mut();
 
         // Активный тап (может менять/поглощать события — запас на будущее;
@@ -160,11 +201,13 @@ impl TypingPipeline {
     }
 
     /// Периодический тик из поллинга (UI NSTimer / headless CFRunLoopTimer):
-    /// обновляет конфиг, исключения и поднимает упавший тап.
+    /// обновляет конфиг, исключения, поднимает упавший тап и следит за
+    /// попапом подсказок (смена приложения, таймаут).
     pub fn tick(&mut self, system: &mut MacSystem, config: &Config) {
         self.typing_detect = config.typing_detect;
         self.retro_fix = config.retro_fix;
         self.hotkey = config.convert_hotkey;
+        self.spell = spell_cfg(config);
         // Хоткей работает независимо от typing_detect, поэтому слова
         // отслеживаются всегда; при выключенном автопереключении решения
         // подавляем запретительно большим min_prefix.
@@ -175,12 +218,31 @@ impl TypingPipeline {
         self.predictor.update_config(pcfg);
 
         // Исключения: приложение из exclude_apps или мы сами (окно настроек).
+        let mut active: Option<(String, String)> = None;
         self.excluded = false;
         if let Some(win) = system.active_window() {
             self.excluded = is_own_app(&win.app_id, &win.app_name, self.own_exe.as_deref())
                 || config.is_excluded(&win.app_id)
                 || config.is_excluded(&win.app_name);
+            active = Some((win.app_id, win.app_name));
         }
+
+        // Попап подсказок: закрываем при исключении, таймауте и смене
+        // приложения (исправление «в чужое окно» бессмысленно).
+        if self.panel_visible {
+            let app_changed = match (&self.panel_app, &active) {
+                (Some((id, name)), Some((cur_id, cur_name))) => cur_id != id && cur_name != name,
+                (None, Some(_)) => false, // приложение ещё не зафиксировано
+                _ => true,
+            };
+            let timed_out = self
+                .panel_shown_at
+                .is_some_and(|t| t.elapsed() > SUGGEST_TIMEOUT);
+            if self.excluded || timed_out || app_changed {
+                self.hide_suggest_panel();
+            }
+        }
+
         // Watchdog: тап мог быть выключен системой (Secure Input, таймаут).
         // Восстановление делаем здесь, а не только в колбэке.
         unsafe {
@@ -210,7 +272,31 @@ impl TypingPipeline {
             return event;
         };
 
-        // 3. Хоткей конвертации работает всегда (модификаторы сверяем точно).
+        // 3. Открытый попап подсказок: цифра 1–9 применяет вариант, Esc
+        // закрывает; обе поглощаются. Любая другая клавиша закрывает
+        // попап и пропускается дальше (печать не прерывается).
+        if self.panel_visible {
+            if keycode == codes::ESCAPE {
+                self.hide_suggest_panel();
+                return core::ptr::null_mut();
+            }
+            let mods = ffi::KCG_FLAG_CONTROL
+                | ffi::KCG_FLAG_OPTION
+                | ffi::KCG_FLAG_COMMAND
+                | ffi::KCG_FLAG_NUMERIC_PAD;
+            let plain_digit = self.flags & mods == 0
+                && self.flags & ffi::KCG_FLAG_SHIFT == 0
+                && digit_index(keycode).is_some_and(|i| i < self.pending_fixes.len());
+            if plain_digit {
+                let index = digit_index(keycode).expect("проверено выше");
+                self.apply_suggest_fix(index);
+                return core::ptr::null_mut();
+            }
+            self.hide_suggest_panel();
+            // Событие не поглощаем — обычная печать продолжается.
+        }
+
+        // 4. Хоткей конвертации работает всегда (модификаторы сверяем точно).
         if self.hotkey_matches(keycode) {
             log::debug!("хоткей: нажатие распознано (keycode={keycode:#x})");
             self.convert_last_word();
@@ -222,15 +308,16 @@ impl TypingPipeline {
             self.mod_tap_armed = false;
         }
 
-        // 4. В исключениях не вмешиваемся (и слова не запоминаем).
+        // 5. В исключениях не вмешиваемся (и слова не запоминаем).
         // При typing_detect=false слова всё равно трекаются — для хоткея;
         // сами решения подавлены min_prefix=MAX (см. tick).
         if self.excluded {
             self.predictor.reset_word();
+            self.hide_suggest_panel();
             return event;
         }
 
-        // 5. Модификаторы кроме Shift (и Caps) — не печатаем: сброс слова.
+        // 6. Модификаторы кроме Shift (и Caps) — не печатаем: сброс слова.
         let disallowed = ffi::KCG_FLAG_CONTROL
             | ffi::KCG_FLAG_OPTION
             | ffi::KCG_FLAG_COMMAND
@@ -240,7 +327,7 @@ impl TypingPipeline {
             return event;
         }
 
-        // 6. Определяем текущую раскладку и ручную смену.
+        // 7. Определяем текущую раскладку и ручную смену.
         let current_layout = self.current_layout();
         let manual_change = match (self.last_layout, current_layout) {
             (Some(prev), cur) => prev != cur,
@@ -252,7 +339,7 @@ impl TypingPipeline {
             return event;
         }
 
-        // 7. Печатаем в предиктор (Shift XOR Caps — фактический регистр).
+        // 8. Печатаем в предиктор (Shift XOR Caps — фактический регистр).
         let shift = self.flags & ffi::KCG_FLAG_SHIFT != 0;
         let caps = self.flags & ffi::KCG_FLAG_ALPHA_SHIFT != 0;
         let decision = self.predictor.feed_key(
@@ -264,7 +351,9 @@ impl TypingPipeline {
             Instant::now(),
         );
 
-        // 8. Решение: переключение + ретро-фикс.
+        // 9. Решение: переключение + ретро-фикс; иначе — спеллчек
+        // зафиксированного слова (попап у каретки).
+        let committed = self.predictor.take_committed();
         if let Decision::SwitchAndFix {
             layout,
             replacement,
@@ -272,8 +361,97 @@ impl TypingPipeline {
         } = decision
         {
             self.apply_switch(current_layout, layout, &replacement, typed);
+        } else if let Some(word) = committed {
+            self.maybe_suggest(&word, current_layout);
         }
         event
+    }
+
+    /// Спеллчек зафиксированного слова и показ попапа при наличии вариантов.
+    fn maybe_suggest(&mut self, word: &CommittedWord, current: Layout) {
+        self.pending_fixes.clear();
+        if !self.spell.enabled || word.sep != Some(' ') || word.auto_switched {
+            return;
+        }
+        let (typed_view, other_view) = match current {
+            Layout::En => (word.view_en.as_deref(), word.view_ru.as_deref()),
+            Layout::Ru => (word.view_ru.as_deref(), word.view_en.as_deref()),
+            Layout::Other => return,
+        };
+        let Some(typed_view) = typed_view else {
+            return;
+        };
+        let suggestions =
+            spell::suggestions(self.predictor.langs(), typed_view, other_view, &self.spell);
+        if suggestions.is_empty() {
+            return;
+        }
+
+        // «Рецепты»: стереть слово+пробел, ввести вариант+пробел.
+        // Конвертации раскладки — с переключением (как хоткей конвертации).
+        let sep = word.sep.unwrap_or(' ');
+        self.pending_fixes = suggestions
+            .iter()
+            .map(|s| SuggestFix {
+                backspaces: word.typed + 1,
+                text: format!("{}{}", s.text, sep),
+                layout: (s.kind == SuggestionKind::Layout).then_some(match current {
+                    Layout::En => Layout::Ru,
+                    _ => Layout::En,
+                }),
+            })
+            .collect();
+        let labels: Vec<String> = suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}  {}", i + 1, s.text))
+            .collect();
+
+        self.suggest_panel.show(&labels);
+        self.panel_visible = true;
+        self.panel_shown_at = Some(Instant::now());
+        self.panel_app = self.system.active_window().map(|w| (w.app_id, w.app_name));
+        log::info!(
+            "Режим печати: попап подсказок (вариантов: {})",
+            labels.len()
+        );
+    }
+
+    /// Прячет попап подсказок и забывает «рецепты».
+    fn hide_suggest_panel(&mut self) {
+        if self.panel_visible {
+            self.suggest_panel.hide();
+            self.panel_visible = false;
+        }
+        self.pending_fixes.clear();
+        self.panel_shown_at = None;
+        self.panel_app = None;
+    }
+
+    /// Применяет вариант исправления из попапа (клик мышью или цифра).
+    pub(crate) fn apply_suggest_fix(&mut self, index: usize) {
+        let Some(fix) = self.pending_fixes.get(index) else {
+            return;
+        };
+        let fix = SuggestFix {
+            backspaces: fix.backspaces,
+            text: fix.text.clone(),
+            layout: fix.layout,
+        };
+        self.hide_suggest_panel();
+        if let Some(target) = fix.layout {
+            if !self.system.set_layout(target) {
+                log::warn!("подсказка: не удалось переключить раскладку на {target:?}");
+            }
+            // Наше переключение не должно выглядеть ручной сменой.
+            self.last_layout = Some(target);
+        }
+        unsafe {
+            self.post_backspaces(fix.backspaces);
+            self.post_unicode(&fix.text);
+        }
+        self.predictor.forget_last();
+        log::info!("Режим печати: подсказка применена");
     }
 
     /// Хоткей-конвертация последнего слова в другую раскладку
@@ -449,6 +627,32 @@ fn predictor_cfg(config: &Config) -> PredictorConfig {
     }
 }
 
+/// Проекция Config → настройки спеллчека.
+fn spell_cfg(config: &Config) -> SpellConfig {
+    SpellConfig {
+        enabled: config.spell_suggest,
+        min_chars: config.spell_min_chars.max(1),
+        // Выбор в попапе — цифры 1–9, больше и не показать.
+        max_suggestions: config.spell_max_suggestions.clamp(1, 9),
+    }
+}
+
+/// Индекс варианта по коду цифровой клавиши верхнего ряда (1..=9 → 0..=8).
+fn digit_index(keycode: u8) -> Option<usize> {
+    match keycode {
+        0x12 => Some(0), // 1
+        0x13 => Some(1), // 2
+        0x14 => Some(2), // 3
+        0x15 => Some(3), // 4
+        0x17 => Some(4), // 5
+        0x16 => Some(5), // 6
+        0x1A => Some(6), // 7
+        0x1C => Some(7), // 8
+        0x19 => Some(8), // 9
+        _ => None,
+    }
+}
+
 /// Точное совпадение набора модификаторов с флагами события.
 fn mods_match(m: HotkeyMods, f: ffi::CGEventFlags) -> bool {
     (f & ffi::KCG_FLAG_CONTROL != 0) == m.ctrl
@@ -547,5 +751,38 @@ mod tests {
         assert!(!mods_match(hk.mods, extra));
         assert!(extra & hotkey_mod_mask(hk.mods) != 0);
         // отпустили всё (flags = 0): mods_match уже false, триггер допустим
+    }
+
+    #[test]
+    fn top_row_digit_keycodes() {
+        for (code, idx) in [
+            (0x12, 0), // 1
+            (0x13, 1), // 2
+            (0x14, 2), // 3
+            (0x15, 3), // 4
+            (0x17, 4), // 5
+            (0x16, 5), // 6
+            (0x1A, 6), // 7
+            (0x1C, 7), // 8
+            (0x19, 8), // 9
+        ] {
+            assert_eq!(digit_index(code), Some(idx));
+        }
+        // Ноль и не-цифры варианты не выбирают.
+        assert_eq!(digit_index(0x1D), None); // 0
+        assert_eq!(digit_index(codes::SPACE), None);
+        assert_eq!(digit_index(0x53), None); // numpad 1
+    }
+
+    #[test]
+    fn spell_cfg_clamps() {
+        let mut cfg = Config::default();
+        cfg.spell_suggest = false;
+        cfg.spell_min_chars = 0;
+        cfg.spell_max_suggestions = 42;
+        let s = spell_cfg(&cfg);
+        assert!(!s.enabled);
+        assert_eq!(s.min_chars, 1);
+        assert_eq!(s.max_suggestions, 9);
     }
 }
