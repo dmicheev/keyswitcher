@@ -252,7 +252,11 @@ unit-тестами на заглушке `StubSystem` и встроенных �
 
 - активное приложение — `NSWorkspace.frontmostApplication`;
 - раскладка — Carbon TIS (`Text Input Source`): определение и принудительный
-  выбор EN/RU из числа включённых источников ввода;
+  выбор EN/RU из числа включённых источников ввода. Язык источника
+  определяется **по скрипту символов, которые он печатает** (UCKeyTranslate):
+  любая латинская раскладка — канадская, US-International, Dvorak — это EN,
+  любая кириллическая — RU; фолбек — по ID (`...us`, `english`, `russian`,
+  `canad`, ...), методы ввода (CJK) не трогаются;
 - заголовок окна — Accessibility API через небольшой C-мост
   `assets/ax_bridge.c` (собирается `build.rs`), с таймаутом 0.25 с;
 - режим печати — `CGEventTap`/`CGEventPost` (CoreGraphics) и

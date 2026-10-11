@@ -79,12 +79,10 @@ unsafe fn find_layout_source(layout: Layout) -> Option<ffi::TISInputSourceRef> {
         if src.is_null() {
             continue;
         }
-        if let Some(sid) = ffi::input_source_id(src) {
-            if crate::macos::MacSystem::classify(&sid) == layout {
-                ffi::CFRetain(src as ffi::CFTypeRef);
-                found = Some(src);
-                break;
-            }
+        if crate::macos::system::MacSystem::classify_source(src) == layout {
+            ffi::CFRetain(src as ffi::CFTypeRef);
+            found = Some(src);
+            break;
         }
     }
     ffi::CFRelease(list as ffi::CFTypeRef);
@@ -156,6 +154,51 @@ unsafe fn translate_one(
     }
     let s: Vec<u16> = out[..actual].to_vec();
     char::from_u32(u32::from(s[0])).filter(|c| !c.is_control() && !c.is_whitespace())
+}
+
+/// Классификация источника ввода по скрипту символов, которые он реально
+/// печатает: буквенные клавиши (0x00–0x2F) транслируются без модификаторов
+/// через `UCKeyTranslate`; кириллица → `Ru`, латиница → `En`. Работает для
+/// любых раскладок независимо от их имени (канадская, US-International,
+/// Dvorak, ...). `None` — данных раскладки нет или букв не найдено
+/// (вызывающий использует фолбек по ID).
+///
+/// # Safety
+/// `src` — валидный TISInputSourceRef из включённых источников (main-поток).
+pub(crate) unsafe fn script_layout(src: ffi::TISInputSourceRef) -> Option<Layout> {
+    let prop = ffi::TISGetInputSourceProperty(src, ffi::kTISPropertyUnicodeKeyLayoutData);
+    if prop.is_null() {
+        return None;
+    }
+    let layout = ffi::CFDataGetBytePtr(prop as ffi::CFDataRef) as ffi::UCKeyboardLayoutRef;
+    if layout.is_null() {
+        return None;
+    }
+    let kbd_type = u32::from(ffi::LMGetKbdType());
+    let mut cyrillic = 0usize;
+    let mut latin = 0usize;
+    for code in 0u8..=0x2F {
+        let Some(c) = translate_one(layout, code, 0, kbd_type) else {
+            continue;
+        };
+        if is_cyrillic(c) {
+            cyrillic += 1;
+        } else if c.is_ascii_alphabetic() {
+            latin += 1;
+        }
+    }
+    if cyrillic == 0 && latin == 0 {
+        return None;
+    }
+    if cyrillic > latin {
+        Some(Layout::Ru)
+    } else {
+        Some(Layout::En)
+    }
+}
+
+fn is_cyrillic(c: char) -> bool {
+    matches!(c, 'А'..='я' | 'Ё' | 'ё')
 }
 
 #[cfg(test)]

@@ -109,13 +109,14 @@ impl MacSystem {
                     continue;
                 }
                 let sid = ffi::input_source_id(src).unwrap_or_else(|| "<без ID>".into());
-                println!("  {:<45} {:?}", sid, Self::classify(&sid));
+                println!("  {:<45} {:?}", sid, Self::classify_source(src));
             }
             ffi::CFRelease(list as ffi::CFTypeRef);
         }
     }
 
-    /// Классификация источника ввода по его ID.
+    /// Классификация источника по ID — статический фолбек для случая, когда
+    /// раскладка не отдаёт свои данные (`kTISPropertyUnicodeKeyLayoutData`).
     pub(crate) fn classify(id_str: &str) -> Layout {
         let s = id_str.to_ascii_lowercase();
         // Управляем только клавиатурными раскладками; методы ввода
@@ -131,11 +132,33 @@ impl MacSystem {
             || s.contains("british")
             || s.contains("english")
             || s.contains("abc")
+            || s.contains("canad")
+            || s.contains("csa")
         {
             Layout::En
         } else {
             Layout::Other
         }
+    }
+
+    /// Классификация источника ввода «как он есть»: сначала по скрипту
+    /// символов, которые раскладка реально печатает (UCKeyTranslate —
+    /// любые латинские/кириллические раскладки, включая канадскую),
+    /// фолбек — по ID ([`Self::classify`]).
+    ///
+    /// # Safety
+    /// `src` — валидный TISInputSourceRef (main-поток).
+    pub(crate) unsafe fn classify_source(src: ffi::TISInputSourceRef) -> Layout {
+        // Методы ввода (не keylayout) не трогаем даже при наличии у них
+        // данных раскладки — иначе CJK-режимы ложно уйдут в EN.
+        let sid = ffi::input_source_id(src).unwrap_or_default();
+        if !sid.to_ascii_lowercase().contains("keylayout") {
+            return Layout::Other;
+        }
+        if let Some(layout) = crate::macos::keymap::script_layout(src) {
+            return layout;
+        }
+        Self::classify(&sid)
     }
 
     /// Сканирует ВКЛЮЧЁННЫЕ источники ввода и собирает ID раскладок EN/RU.
@@ -159,16 +182,13 @@ impl MacSystem {
                 if src.is_null() {
                     continue;
                 }
-                if let Some(sid) = ffi::input_source_id(src) {
-                    match Self::classify(&sid) {
-                        Layout::En if !self.known.en_ids.contains(&sid) => {
-                            self.known.en_ids.push(sid)
-                        }
-                        Layout::Ru if !self.known.ru_ids.contains(&sid) => {
-                            self.known.ru_ids.push(sid)
-                        }
-                        _ => {}
-                    }
+                let Some(sid) = ffi::input_source_id(src) else {
+                    continue;
+                };
+                match Self::classify_source(src) {
+                    Layout::En if !self.known.en_ids.contains(&sid) => self.known.en_ids.push(sid),
+                    Layout::Ru if !self.known.ru_ids.contains(&sid) => self.known.ru_ids.push(sid),
+                    _ => {}
                 }
             }
             ffi::CFRelease(list as ffi::CFTypeRef);
@@ -237,12 +257,15 @@ impl System for MacSystem {
 
     fn current_layout(&mut self) -> Layout {
         self.refresh_known_sources();
-        // Safety: см. ffi::current_input_source_id.
+        // Safety: TISCopyCurrentKeyboardInputSource возвращает +1 retain.
         unsafe {
-            match ffi::current_input_source_id() {
-                Some(id) => Self::classify(&id),
-                None => Layout::Other,
+            let src = ffi::TISCopyCurrentKeyboardInputSource();
+            if src.is_null() {
+                return Layout::Other;
             }
+            let layout = Self::classify_source(src);
+            ffi::CFRelease(src as ffi::CFTypeRef);
+            layout
         }
     }
 
@@ -354,6 +377,21 @@ mod tests {
             MacSystem::classify("com.apple.keylayout.RussianWin"),
             Layout::Ru
         );
+        // Канадские раскладки — латинская сторона пары (ID-фолбек;
+        // основной путь — скрипт-детект по UCKeyTranslate).
+        assert_eq!(
+            MacSystem::classify("com.apple.keylayout.Canadian"),
+            Layout::En
+        );
+        assert_eq!(
+            MacSystem::classify("com.apple.keylayout.CanadianEnglish"),
+            Layout::En
+        );
+        assert_eq!(
+            MacSystem::classify("com.apple.keylayout.CanadianFrench"),
+            Layout::En
+        );
+        assert_eq!(MacSystem::classify("com.apple.keylayout.CSA"), Layout::En);
         // Методы ввода (не keylayout) не классифицируем — даже если в ID
         // встречается "abc".
         assert_eq!(

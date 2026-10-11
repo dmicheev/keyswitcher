@@ -242,26 +242,11 @@ pub unsafe fn input_source_id(src: TISInputSourceRef) -> Option<String> {
     cfstring_to_string(prop as CFStringRef)
 }
 
-/// Возвращает строковый ID текущего источника ввода (раскладки), либо None.
-///
-/// # Safety
-/// Требует корректно инициализированного Carbon-окружения (main-поток с NSRunLoop).
-pub unsafe fn current_input_source_id() -> Option<String> {
-    let src = TISCopyCurrentKeyboardInputSource();
-    if src.is_null() {
-        return None;
-    }
-    let id = input_source_id(src);
-    // TISCopyCurrentKeyboardInputSource возвращает объект с +1 retain — обязаны освободить.
-    CFRelease(src as CFTypeRef);
-    id
-}
-
 /// Ищет включённый источник ввода с заданным ID.
 ///
 /// # Safety
-/// См. [`current_input_source_id`]. Возвращаемый ref принадлежит созданному
-/// списку — его нельзя освобождать отдельно от списка.
+/// Требует корректно инициализированного Carbon-окружения (main-поток с NSRunLoop).
+/// Возвращаемый ref принадлежит созданному списку — его нельзя освобождать отдельно от списка.
 pub unsafe fn find_input_source(id: &str) -> Option<(TISInputSourceRef, CFArrayRef)> {
     // allSources = 0: только ВКЛЮЧЁННЫЕ пользователем источники —
     // TISSelectInputSource гарантированно работает лишь для них.
