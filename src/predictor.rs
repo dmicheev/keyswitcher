@@ -12,6 +12,11 @@
 //! [`Decision::SwitchAndFix`] — переключить раскладку и заменить уже
 //! набранный префикс. Гистерезис: максимум одно автопереключение на слово.
 //!
+//! Слова короче трёх символов частотными моделями не оцениваются вовсе:
+//! для них работает замкнутая карта русского языка ([`crate::short_words`]),
+//! проверяемая на границе слова (по разделителю); всё, что в неё не
+//! попало, считается латиницей и не трогается.
+//!
 //! Словом считается последовательность клавиш, дающих букву (или дефис/
 //! апостроф) хоть в одной раскладке — так RU-слова с х/ж/б/ю/ъ/ё (клавиши
 //! `[ ; , . ]` и backtick в EN) исправляются и из EN-раскладки.
@@ -25,6 +30,7 @@ use crate::dict::FrequencyDict;
 use crate::engine::Layout;
 use crate::keymap::KeyChars;
 use crate::ngram::NGramModel;
+use crate::short_words::{self, is_short_ru};
 
 /// Словарь + n-граммная модель одного языка.
 pub struct LangModel {
@@ -107,6 +113,10 @@ pub struct PredictorConfig {
     pub switch_threshold: f64,
     /// Вес n-граммного счёта α.
     pub ngram_weight: f64,
+    /// Автопереключение включено (проекция `typing_detect`). При `false`
+    /// слова отслеживаются только для хоткея и подсказок — решения,
+    /// включая карту коротких слов, не выдаются.
+    pub enabled: bool,
 }
 
 impl Default for PredictorConfig {
@@ -115,6 +125,7 @@ impl Default for PredictorConfig {
             min_prefix: 3,
             switch_threshold: 100.0,
             ngram_weight: 3.0,
+            enabled: true,
         }
     }
 }
@@ -190,6 +201,9 @@ pub struct Predictor {
     pending: Option<CommittedWord>,
     /// Сработало ли автопереключение в текущем слове (гистерезис).
     switched: bool,
+    /// Раскладка, в которой набрано текущее слово (по первой клавише):
+    /// карта коротких слов чинит только слова, набранные в EN.
+    typed_layout: Option<Layout>,
     last_event: Option<Instant>,
 }
 
@@ -203,6 +217,7 @@ impl Predictor {
             last_after: None,
             pending: None,
             switched: false,
+            typed_layout: None,
             last_event: None,
         }
     }
@@ -234,6 +249,7 @@ impl Predictor {
         self.last_after = None;
         self.pending = None;
         self.switched = false;
+        self.typed_layout = None;
     }
 
     /// Обрабатывает нажатие клавиши. Возвращает решение, если пора
@@ -272,12 +288,13 @@ impl Predictor {
                 return Decision::None;
             }
             let sep = is_separator_key(keycode).then(|| sep_char(keycode));
-            self.commit_after(sep);
+            let fix = self.commit_after(sep);
             if sep.is_none() {
                 // Курсор мог уйти — конвертировать «последнее слово» небезопасно.
                 self.last_word = None;
             }
-            return Decision::None;
+            // Решение карты коротких слов приходит именно на разделителе.
+            return fix.unwrap_or(Decision::None);
         };
         let (current_char, other_char) = match current_layout {
             Layout::En => (en, ru),
@@ -303,7 +320,9 @@ impl Predictor {
         if !word_key {
             // Цифра/пунктуация в обеих раскладках — слово закончилось.
             // Запоминаем сам символ: хоткей-конвертация сотрёт и введёт
-            // его обратно, не подменяя пробелом.
+            // его обратно, не подменяя пробелом. Карту коротких слов тут
+            // не применяем: «C++», «A/B» и т.п. остались бы без «+»/«/»
+            // в другой раскладке.
             self.commit_after(Some(current_char));
             return Decision::None;
         }
@@ -311,6 +330,7 @@ impl Predictor {
         if self.buffer.len() >= MAX_WORD {
             self.commit();
         }
+        self.typed_layout.get_or_insert(current_layout);
         self.buffer.push(KeyPress {
             code: keycode,
             en,
@@ -321,7 +341,11 @@ impl Predictor {
 
     /// Скоринг и решение по текущему буферу.
     fn decide(&mut self, current_layout: Layout) -> Decision {
-        if self.switched || self.buffer.len() < self.cfg.min_prefix {
+        // Слова короче `short_words::MAX_LEN + 1` символа частотными
+        // моделями не оцениваются даже при заниженном min_prefix —
+        // только карта коротких слов на границе слова (см. short_word_fix).
+        let floor = self.cfg.min_prefix.max(short_words::MAX_LEN + 1);
+        if !self.cfg.enabled || self.switched || self.buffer.len() < floor {
             return Decision::None;
         }
         let Some(en_word) = self.view(Layout::En) else {
@@ -398,24 +422,61 @@ impl Predictor {
 
     /// Фиксирует слово; `after` — символ, идущий в тексте сразу за словом
     /// (разделитель либо цифра/пунктуация, оборвавшая слово; `None` —
-    /// неизвестно: пауза, функциональная клавиша).
-    fn commit_after(&mut self, after: Option<char>) {
-        if !self.buffer.is_empty() {
+    /// неизвестно: пауза, функциональная клавиша). Возвращает решение
+    /// карты коротких слов, если оно принято.
+    fn commit_after(&mut self, after: Option<char>) -> Option<Decision> {
+        let fix = if self.buffer.is_empty() {
+            None
+        } else {
             let word = std::mem::take(&mut self.buffer);
             // Спеллчек-подсказки показываем только по «настоящему»
             // разделителю (space/enter/tab).
             let sep = after.filter(|&c| matches!(c, ' ' | '\n' | '\t'));
+            let fix = self.short_word_fix(&word, sep);
             self.last_after = after;
             self.pending = Some(CommittedWord {
                 view_en: view_of(&word, Layout::En),
                 view_ru: view_of(&word, Layout::Ru),
                 typed: word.len(),
                 sep,
-                auto_switched: self.switched,
+                auto_switched: self.switched || fix.is_some(),
             });
             self.last_word = Some(word);
-        }
+            self.typed_layout = None;
+            fix
+        };
         self.switched = false;
+        fix
+    }
+
+    /// Хардкод-правило для коротких слов (1–2 символа): словари и
+    /// n-граммы на них не работают, поэтому гипотеза «русское» проверяется
+    /// по замкнутой карте ([`crate::short_words`]); всё прочее — латиница.
+    /// Срабатывает только по настоящему разделителю: после пунктуации
+    /// («C++», «A/B») и на паузе (слово может быть началом длинного
+    /// латинского) вмешиваться нельзя. Замена — русский вид набранного
+    /// с сохранением регистра плюс сам разделитель.
+    fn short_word_fix(&self, word: &[KeyPress], sep: Option<char>) -> Option<Decision> {
+        let sep = sep?;
+        if !self.cfg.enabled
+            || self.switched
+            || word.len() > short_words::MAX_LEN
+            || self.typed_layout != Some(Layout::En)
+        {
+            return None;
+        }
+        let ru = view_of(word, Layout::Ru)?;
+        if !is_short_ru(&ru.to_lowercase()) {
+            return None;
+        }
+        let mut replacement = String::with_capacity(ru.len() + sep.len_utf8());
+        replacement.push_str(&ru);
+        replacement.push(sep);
+        Some(Decision::SwitchAndFix {
+            layout: Layout::Ru,
+            replacement,
+            typed: word.len() + 1,
+        })
     }
 
     /// Конвертация последнего слова в другую раскладку (хоткей).
@@ -744,6 +805,223 @@ mod tests {
         now += WORD_PAUSE + Duration::from_millis(100);
         let d = p.feed_key(0x0B, false, Layout::En, false, &StaticKeymap, now);
         assert_eq!(d, Decision::None); // буфер из 1 символа < min_prefix
+    }
+
+    #[test]
+    fn short_word_fixes_on_separator() {
+        // Карты коротких слов: «набранное в EN» -> русский вид + разделитель.
+        let cases = [
+            ("d", "в "),
+            ("c", "с "),
+            ("b", "и "),
+            ("r", "к "),
+            ("e", "у "),
+            ("j", "о "),
+            ("f", "а "),
+            ("z", "я "),
+            ("yt", "не "),
+            ("yf", "на "),
+            ("gj", "по "),
+            ("bp", "из "),
+            ("jy", "он "),
+            ("ds", "вы "),
+            ("tt", "ее "),
+            ("Yt", "Не "), // регистр сохранён
+            ("j,", "об "), // «б» — клавиша запятой в EN
+            ("b[", "их "), // «х» — клавиша `[`
+            ("t`", "её "), // «ё» — backtick
+            ("e;", "уж "), // «ж» — клавиша `;`
+        ];
+        for (typed, expected) in cases {
+            let mut p = pred(PredictorConfig::default());
+            let mut now = t0();
+            type_word(
+                &mut p,
+                typed,
+                Layout::En,
+                &mut now,
+                Duration::from_millis(50),
+            );
+            now += Duration::from_millis(50);
+            assert_eq!(
+                p.feed_key(
+                    crate::keymap::codes::SPACE,
+                    false,
+                    Layout::En,
+                    false,
+                    &StaticKeymap,
+                    now
+                ),
+                Decision::SwitchAndFix {
+                    layout: Layout::Ru,
+                    replacement: expected.into(),
+                    typed: typed.chars().count() + 1,
+                },
+                "ввод {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_word_typed_in_ru_untouched() {
+        // Слово уже набрано в русской раскладке — чинить нечего.
+        let mut p = pred(PredictorConfig::default());
+        let mut now = t0();
+        type_word(&mut p, "в", Layout::Ru, &mut now, Duration::from_millis(50));
+        now += Duration::from_millis(50);
+        assert_eq!(
+            p.feed_key(
+                crate::keymap::codes::SPACE,
+                false,
+                Layout::Ru,
+                false,
+                &StaticKeymap,
+                now
+            ),
+            Decision::None
+        );
+    }
+
+    #[test]
+    fn short_latin_word_untouched() {
+        // «to» — латиница: RU-вид «ещ» вне карты. min_prefix=1 дополнительно
+        // проверяет, что частотный скоринг коротких слов подавлен жёстко,
+        // а не только дефолтным min_prefix=3.
+        let cfg = PredictorConfig {
+            min_prefix: 1,
+            ..PredictorConfig::default()
+        };
+        let mut p = pred(cfg);
+        let mut now = t0();
+        let ds = type_word(
+            &mut p,
+            "to",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        assert!(switch_only(&ds).is_empty());
+        now += Duration::from_millis(50);
+        assert_eq!(
+            p.feed_key(
+                crate::keymap::codes::SPACE,
+                false,
+                Layout::En,
+                false,
+                &StaticKeymap,
+                now
+            ),
+            Decision::None
+        );
+    }
+
+    #[test]
+    fn short_word_by_map_not_dictionary() {
+        // При min_prefix=1 раньше словарь решал уже на 1-м символе и ломал
+        // начала длинных латинских слов; теперь короткие слова решает
+        // только карта — и только на границе слова.
+        let cfg = PredictorConfig {
+            min_prefix: 1,
+            ..PredictorConfig::default()
+        };
+        let mut p = pred(cfg);
+        let mut now = t0();
+        let ds = type_word(&mut p, "d", Layout::En, &mut now, Duration::from_millis(50));
+        assert!(switch_only(&ds).is_empty(), "посреди слова решений нет");
+        now += Duration::from_millis(50);
+        assert_eq!(
+            p.feed_key(
+                crate::keymap::codes::SPACE,
+                false,
+                Layout::En,
+                false,
+                &StaticKeymap,
+                now
+            ),
+            Decision::SwitchAndFix {
+                layout: Layout::Ru,
+                replacement: "в ".into(),
+                typed: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn punctuation_after_short_word_does_not_switch() {
+        // «C++»: слово оборвано плюсом — не разделителем, не вмешиваемся.
+        let mut p = pred(PredictorConfig::default());
+        let mut now = t0();
+        type_word(&mut p, "c", Layout::En, &mut now, Duration::from_millis(50));
+        now += Duration::from_millis(50);
+        assert_eq!(
+            p.feed_key(0x18, true, Layout::En, false, &StaticKeymap, now), // '+'
+            Decision::None
+        );
+        let c = p.take_committed().expect("слово зафиксировано плюсом");
+        assert_eq!(c.view_en.as_deref(), Some("c"));
+        assert!(!c.auto_switched);
+    }
+
+    #[test]
+    fn paused_short_word_not_switched() {
+        // «d» + пауза: возможно, начало длинного латинского слова — карта
+        // коротких слов на паузе не срабатывает.
+        let mut p = pred(PredictorConfig::default());
+        let mut now = t0();
+        type_word(&mut p, "d", Layout::En, &mut now, Duration::from_millis(50));
+        now += WORD_PAUSE + Duration::from_millis(100);
+        let d = p.feed_key(0x04, false, Layout::En, false, &StaticKeymap, now); // 'h'
+        assert_eq!(d, Decision::None);
+    }
+
+    #[test]
+    fn disabled_predictor_skips_short_map() {
+        let cfg = PredictorConfig {
+            enabled: false,
+            ..PredictorConfig::default()
+        };
+        let mut p = pred(cfg);
+        let mut now = t0();
+        type_word(&mut p, "d", Layout::En, &mut now, Duration::from_millis(50));
+        now += Duration::from_millis(50);
+        assert_eq!(
+            p.feed_key(
+                crate::keymap::codes::SPACE,
+                false,
+                Layout::En,
+                false,
+                &StaticKeymap,
+                now
+            ),
+            Decision::None
+        );
+    }
+
+    #[test]
+    fn short_fix_marks_committed_auto_switched() {
+        let mut p = pred(PredictorConfig::default());
+        let mut now = t0();
+        type_word(
+            &mut p,
+            "yt",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        now += Duration::from_millis(50);
+        assert!(matches!(
+            p.feed_key(
+                crate::keymap::codes::SPACE,
+                false,
+                Layout::En,
+                false,
+                &StaticKeymap,
+                now
+            ),
+            Decision::SwitchAndFix { .. }
+        ));
+        let c = p.take_committed().expect("слово зафиксировано");
+        assert!(c.auto_switched, "подсказки по исправленному не нужны");
     }
 
     fn no_switch_cfg() -> PredictorConfig {

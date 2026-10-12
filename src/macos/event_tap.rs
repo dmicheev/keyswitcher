@@ -16,6 +16,9 @@
 //! * события с модификаторами (кроме Shift) не анализируются и не меняются;
 //! * Secure Input / отключение тапа системой → молчаливая деградация
 //!   (ре-включение тапа, ничего не переключаем);
+//! * первый запуск без разрешения Accessibility: конвейер живёт без тапа,
+//!   `tick` периодически пытается его создать — после выдачи разрешения
+//!   в «Универсальном доступе» режим печати включается без перезапуска;
 //! * приложения из `exclude_apps` и собственное окно настроек не трогаем.
 
 use std::time::{Duration, Instant};
@@ -92,9 +95,10 @@ pub struct TypingPipeline {
 }
 
 impl TypingPipeline {
-    /// Создаёт конвейер и вешает тап на main run loop.
-    /// `None` — тап создать не удалось (нет разрешения): фича выключена,
-    /// остальное приложение продолжает работать.
+    /// Создаёт конвейер и вешает тап на main run loop. Всегда возвращает
+    /// конвейер: если тап создать не удалось (обычно первый запуск без
+    /// разрешения Accessibility), он работает в деградировавшем режиме,
+    /// а [`Self::tick`] повторяет попытку, пока разрешение не выдадут.
     pub fn install(config: &Config) -> Option<Box<Self>> {
         let posting_source =
             unsafe { ffi::CGEventSourceCreate(ffi::KCG_EVENT_SOURCE_STATE_COMBINED) };
@@ -140,11 +144,32 @@ impl TypingPipeline {
         // Box стабилен, пока конвейер жив.
         let pipe_ptr: *mut TypingPipeline = pipeline.as_mut();
         pipeline.suggest_panel.set_pipe(pipe_ptr);
-        let user_info: *mut TypingPipeline = pipeline.as_mut();
+
+        // Тап: активный (может менять/поглощать события). При первом
+        // запуске без разрешения Accessibility создание не удастся —
+        // тогда конвейер остаётся без тапа, а tick() будет повторять
+        // попытку, пока разрешение не выдадут (без перезапуска).
+        if !pipeline.try_install_tap() {
+            log::warn!("Режим печати: тап не создан — жду разрешение Accessibility");
+        }
+        Some(pipeline)
+    }
+
+    /// Пытается создать event tap и добавить его source в main run loop.
+    /// Вызывается из [`Self::install`] и повторно из [`Self::tick`], пока
+    /// тап не появится: `CGEventTapCreate` возвращает NULL без разрешения
+    /// Accessibility, а после его выдачи в System Settings тап начинает
+    /// работать у уже запущенного процесса — достаточно создать его заново.
+    /// `false` — тапа по-прежнему нет (весь режим печати, включая хоткей,
+    /// остаётся выключенным до следующей попытки).
+    fn try_install_tap(&mut self) -> bool {
+        if !self.tap_port.is_null() {
+            return true;
+        }
+        let user_info: *mut TypingPipeline = self;
 
         // Активный тап (может менять/поглощать события — запас на будущее;
-        // сейчас события мы не модифицируем). При отказе (нет Accessibility) —
-        // слушающий, чтобы хотя бы работал хоткей.
+        // сейчас события мы не модифицируем). При отказе — слушающий.
         let mut listen_only = false;
         let mut tap_port = unsafe {
             ffi::CGEventTapCreate(
@@ -153,15 +178,11 @@ impl TypingPipeline {
                 ffi::KCG_EVENT_TAP_OPTION_DEFAULT,
                 TAP_MASK,
                 tap_callback,
-                user_info as *mut core::ffi::c_void,
+                user_info.cast(),
             )
         };
         if tap_port.is_null() {
             listen_only = true;
-            log::warn!(
-                "Режим печати: активный тап не создан (нет разрешения Accessibility?), \
-                 пробуем слушающий (только хоткей)"
-            );
             tap_port = unsafe {
                 ffi::CGEventTapCreate(
                     ffi::KCG_SESSION_EVENT_TAP,
@@ -169,22 +190,21 @@ impl TypingPipeline {
                     ffi::KCG_EVENT_TAP_OPTION_LISTEN_ONLY,
                     TAP_MASK,
                     tap_callback,
-                    user_info as *mut core::ffi::c_void,
+                    user_info.cast(),
                 )
             };
         }
         if tap_port.is_null() {
-            log::warn!("Режим печати: тап не создан — функция отключена");
-            return None;
+            return false;
         }
-        pipeline.tap_port = tap_port;
+        self.tap_port = tap_port;
         let tap_source =
             unsafe { ffi::CFMachPortCreateRunLoopSource(core::ptr::null_mut(), tap_port, 0) };
         if tap_source.is_null() {
             log::warn!("Режим печати: run-loop source не создан");
-            return None;
+            return false;
         }
-        pipeline.tap_source = tap_source;
+        self.tap_source = tap_source;
         unsafe {
             ffi::CFRunLoopAddSource(
                 ffi::CFRunLoopGetMain(),
@@ -192,31 +212,30 @@ impl TypingPipeline {
                 ffi::kCFRunLoopCommonModes,
             );
         }
-
         log::info!(
-            "Режим печати: тап установлен ({}), typing_detect={}",
-            if listen_only { "listen-only" } else { "active" },
-            config.typing_detect
+            "Режим печати: тап установлен ({})",
+            if listen_only { "listen-only" } else { "active" }
         );
-        Some(pipeline)
+        true
     }
 
     /// Периодический тик из поллинга (UI NSTimer / headless CFRunLoopTimer):
-    /// обновляет конфиг, исключения, поднимает упавший тап и следит за
-    /// попапом подсказок (смена приложения, таймаут).
+    /// обновляет конфиг, исключения, дотягивает тап после выдачи разрешения
+    /// Accessibility и следит за попапом подсказок (смена приложения, таймаут).
     pub fn tick(&mut self, system: &mut MacSystem, config: &Config) {
+        // Тап мог не создаться на старте (первый запуск без разрешения
+        // Accessibility) — пробуем, пока пользователь его не выдаст.
+        if self.tap_port.is_null() {
+            self.try_install_tap();
+        }
         self.typing_detect = config.typing_detect;
         self.retro_fix = config.retro_fix;
         self.hotkey = config.convert_hotkey;
         self.spell = spell_cfg(config);
         // Хоткей работает независимо от typing_detect, поэтому слова
-        // отслеживаются всегда; при выключенном автопереключении решения
-        // подавляем запретительно большим min_prefix.
-        let mut pcfg = predictor_cfg(config);
-        if !config.typing_detect {
-            pcfg.min_prefix = usize::MAX;
-        }
-        self.predictor.update_config(pcfg);
+        // отслеживаются всегда; автопереключение (включая карту коротких
+        // слов) выключено флагом enabled.
+        self.predictor.update_config(predictor_cfg(config));
 
         // Исключения: приложение из exclude_apps или мы сами (окно настроек).
         let mut active: Option<(String, String)> = None;
@@ -247,8 +266,10 @@ impl TypingPipeline {
 
         // Watchdog: тап мог быть выключен системой (Secure Input, таймаут).
         // Восстановление делаем здесь, а не только в колбэке.
-        unsafe {
-            ffi::CGEventTapEnable(self.tap_port, true);
+        if !self.tap_port.is_null() {
+            unsafe {
+                ffi::CGEventTapEnable(self.tap_port, true);
+            }
         }
     }
 
@@ -314,7 +335,7 @@ impl TypingPipeline {
         // (иначе хоткей мог бы конвертировать слово, набранное в
         // исключённом приложении, уже из чужого окна).
         // При typing_detect=false слова всё же трекаются — для хоткея;
-        // сами решения подавлены min_prefix=MAX (см. tick).
+        // сами решения подавлены enabled=false (см. tick).
         if self.excluded {
             self.predictor.forget_last();
             self.hide_suggest_panel();
@@ -631,6 +652,7 @@ fn predictor_cfg(config: &Config) -> PredictorConfig {
         min_prefix: config.min_prefix_chars.max(2),
         switch_threshold: config.switch_threshold.max(1.0),
         ngram_weight: crate::predictor::PredictorConfig::default().ngram_weight,
+        enabled: config.typing_detect,
     }
 }
 
