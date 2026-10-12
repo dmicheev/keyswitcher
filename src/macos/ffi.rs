@@ -14,6 +14,7 @@ pub type CFTypeRef = *const c_void;
 pub type CFStringRef = *const c_void;
 pub type CFArrayRef = *const c_void;
 pub type CFDataRef = *const c_void;
+pub type CFDictionaryRef = *const c_void;
 pub type CFIndex = isize;
 pub type OSStatus = i32;
 pub type Boolean = u8;
@@ -52,6 +53,8 @@ pub type OptionBits = u32;
 extern "C" {
     // ---- CoreFoundation ----
     pub fn CFStringGetCStringPtr(theString: CFStringRef, encoding: u32) -> *const c_char;
+    pub fn CFStringGetLength(theString: CFStringRef) -> CFIndex;
+    pub fn CFStringGetMaximumSizeForEncoding(length: CFIndex, encoding: u32) -> CFIndex;
     pub fn CFStringGetCString(
         theString: CFStringRef,
         buffer: *mut c_char,
@@ -97,7 +100,8 @@ extern "C" {
 
     pub fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
     pub fn TISGetInputSourceProperty(source: TISInputSourceRef, key: CFStringRef) -> *mut c_void;
-    pub fn TISCreateInputSourceList(properties: CFStringRef, allSources: Boolean) -> CFArrayRef;
+    pub fn TISCreateInputSourceList(properties: CFDictionaryRef, allSources: Boolean)
+        -> CFArrayRef;
     pub fn TISSelectInputSource(source: TISInputSourceRef) -> OSStatus;
 
     /// Перевод «код клавиши + модификаторы → символ» по раскладке.
@@ -215,13 +219,18 @@ pub unsafe fn cfstring_to_string(s: CFStringRef) -> Option<String> {
     if !p.is_null() {
         return Some(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned());
     }
-    // Медленная дорожка: копируем в буфер.
-    let len = 1024;
-    let mut buf = vec![0u8; len];
+    // Медленная дорожка: буфер по фактической длине строки (фиксированный
+    // буфер молча терял бы длинные значения).
+    let length = CFStringGetLength(s);
+    let max = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8);
+    if max <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; max as usize + 1];
     let ok = CFStringGetCString(
         s,
         buf.as_mut_ptr() as *mut c_char,
-        len as CFIndex,
+        buf.len() as CFIndex,
         kCFStringEncodingUTF8,
     );
     (ok == 1).then(|| {

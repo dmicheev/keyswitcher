@@ -190,9 +190,7 @@ fn write_variant(buf: &mut String, chars: &[char], skip: usize, insert: Option<c
 
 /// Перенос регистра исходного слова на вариант (ПРИВЕТ / Привет / привет).
 fn apply_case(template: &str, mut s: String) -> String {
-    let all_upper =
-        template.chars().any(char::is_uppercase) && template.chars().all(char::is_uppercase);
-    if all_upper {
+    if template.chars().all(char::is_uppercase) {
         s = s.to_uppercase();
     } else if template.chars().next().is_some_and(char::is_uppercase) {
         let mut it = s.chars();

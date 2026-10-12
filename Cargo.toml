@@ -11,9 +11,17 @@ simplelog = { version = "0.12", default-features = false }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"
 
 [[bin]]
 name = "smartswitcher"
 path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

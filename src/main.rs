@@ -47,14 +47,12 @@ extern "C" fn on_term(_sig: i32) {
 
 #[cfg(unix)]
 fn install_signal_handlers() {
+    // libc уже в дереве зависимостей (objc → malloc_buf); своя декларация
+    // `signal` с неточным типом возврата была бы хрупкой.
     unsafe {
-        extern "C" {
-            fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
-        }
-        const SIGINT: i32 = 2;
-        const SIGTERM: i32 = 15;
-        signal(SIGINT, on_term);
-        signal(SIGTERM, on_term);
+        let handler = on_term as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
 }
 
@@ -62,8 +60,8 @@ fn install_signal_handlers() {
 fn install_signal_handlers() {}
 
 pub(crate) fn log_path() -> std::path::PathBuf {
-    // Журнал — рядом с программой (тот же каталог, что и config.txt).
-    config::base_dir().join("smartswitcher.log")
+    // Журнал — в одном каталоге с конфигом (~/.config/smartswitcher).
+    config::config_dir().join("smartswitcher.log")
 }
 
 fn init_logging() {
@@ -134,6 +132,15 @@ fn main() {
 
     init_logging();
     install_signal_handlers();
+
+    // Одноразовая миграция конфига из «портативного» расположения
+    // (рядом с бинарником) в ~/.config/smartswitcher.
+    if let Some(old) = Config::migrate_portable_config() {
+        log::info!(
+            "Конфигурация перенесена: {old:?} -> {}",
+            Config::default_path().display()
+        );
+    }
 
     let config_path = Config::default_path();
     let config = Config::load(&config_path);

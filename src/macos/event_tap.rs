@@ -70,6 +70,9 @@ pub struct TypingPipeline {
     panel_shown_at: Option<Instant>,
     /// Приложение, для которого показан попап (скрытие при смене).
     panel_app: Option<(String, String)>,
+    /// Кэш активного приложения из tick() — AX-вызовы в колбэке тапа
+    /// запрещены (синхронный обмен с таймаутом 0.25 c тормозит печать).
+    current_app: Option<(String, String)>,
     /// CGEventSource для наших пост-событий (CombinedSessionState).
     posting_source: ffi::CGEventSourceRef,
     /// Порт тапа (для ре-включения после DisabledByTimeout).
@@ -101,8 +104,10 @@ impl TypingPipeline {
         }
 
         // Конвейер сначала (колбэку нужен указатель на него как userInfo),
-        // поля тапа заполняем после создания; тап не сработает раньше,
-        // чем его source добавлен в run loop.
+        // поля тапа заполняем по мере создания ресурсов; тап не сработает
+        // раньше, чем его source добавлен в run loop. Владение ресурсами —
+        // у структуры: в путях ошибки Drop освобождает только созданное
+        // (null-поля пропускаются), ручных CFRelease здесь нет.
         let mut pipeline = Box::new(Self {
             predictor: Predictor::new(
                 crate::predictor::LangPair::load_embedded(),
@@ -119,6 +124,7 @@ impl TypingPipeline {
             panel_visible: false,
             panel_shown_at: None,
             panel_app: None,
+            current_app: None,
             posting_source,
             tap_port: core::ptr::null_mut(),
             tap_source: core::ptr::null_mut(),
@@ -169,19 +175,16 @@ impl TypingPipeline {
         }
         if tap_port.is_null() {
             log::warn!("Режим печати: тап не создан — функция отключена");
-            unsafe { ffi::CFRelease(posting_source as ffi::CFTypeRef) };
             return None;
         }
+        pipeline.tap_port = tap_port;
         let tap_source =
             unsafe { ffi::CFMachPortCreateRunLoopSource(core::ptr::null_mut(), tap_port, 0) };
         if tap_source.is_null() {
             log::warn!("Режим печати: run-loop source не создан");
-            unsafe {
-                ffi::CFRelease(tap_port as ffi::CFTypeRef);
-                ffi::CFRelease(posting_source as ffi::CFTypeRef);
-            }
             return None;
         }
+        pipeline.tap_source = tap_source;
         unsafe {
             ffi::CFRunLoopAddSource(
                 ffi::CFRunLoopGetMain(),
@@ -189,8 +192,6 @@ impl TypingPipeline {
                 ffi::kCFRunLoopCommonModes,
             );
         }
-        pipeline.tap_port = tap_port;
-        pipeline.tap_source = tap_source;
 
         log::info!(
             "Режим печати: тап установлен ({}), typing_detect={}",
@@ -226,6 +227,7 @@ impl TypingPipeline {
                 || config.is_excluded(&win.app_name);
             active = Some((win.app_id, win.app_name));
         }
+        self.current_app = active.clone();
 
         // Попап подсказок: закрываем при исключении, таймауте и смене
         // приложения (исправление «в чужое окно» бессмысленно).
@@ -280,17 +282,17 @@ impl TypingPipeline {
                 self.hide_suggest_panel();
                 return core::ptr::null_mut();
             }
-            let mods = ffi::KCG_FLAG_CONTROL
+            let disallowed = ffi::KCG_FLAG_CONTROL
                 | ffi::KCG_FLAG_OPTION
                 | ffi::KCG_FLAG_COMMAND
-                | ffi::KCG_FLAG_NUMERIC_PAD;
-            let plain_digit = self.flags & mods == 0
-                && self.flags & ffi::KCG_FLAG_SHIFT == 0
-                && digit_index(keycode).is_some_and(|i| i < self.pending_fixes.len());
-            if plain_digit {
-                let index = digit_index(keycode).expect("проверено выше");
-                self.apply_suggest_fix(index);
-                return core::ptr::null_mut();
+                | ffi::KCG_FLAG_NUMERIC_PAD
+                | ffi::KCG_FLAG_SHIFT;
+            if self.flags & disallowed == 0 {
+                if let Some(index) = digit_index(keycode).filter(|&i| i < self.pending_fixes.len())
+                {
+                    self.apply_suggest_fix(index);
+                    return core::ptr::null_mut();
+                }
             }
             self.hide_suggest_panel();
             // Событие не поглощаем — обычная печать продолжается.
@@ -308,11 +310,13 @@ impl TypingPipeline {
             self.mod_tap_armed = false;
         }
 
-        // 5. В исключениях не вмешиваемся (и слова не запоминаем).
-        // При typing_detect=false слова всё равно трекаются — для хоткея;
+        // 5. В исключениях не вмешиваемся — и слова не запоминаем
+        // (иначе хоткей мог бы конвертировать слово, набранное в
+        // исключённом приложении, уже из чужого окна).
+        // При typing_detect=false слова всё же трекаются — для хоткея;
         // сами решения подавлены min_prefix=MAX (см. tick).
         if self.excluded {
-            self.predictor.reset_word();
+            self.predictor.forget_last();
             self.hide_suggest_panel();
             return event;
         }
@@ -410,7 +414,7 @@ impl TypingPipeline {
         self.suggest_panel.show(&labels);
         self.panel_visible = true;
         self.panel_shown_at = Some(Instant::now());
-        self.panel_app = self.system.active_window().map(|w| (w.app_id, w.app_name));
+        self.panel_app = self.current_app.clone();
         log::info!(
             "Режим печати: попап подсказок (вариантов: {})",
             labels.len()
@@ -430,13 +434,8 @@ impl TypingPipeline {
 
     /// Применяет вариант исправления из попапа (клик мышью или цифра).
     pub(crate) fn apply_suggest_fix(&mut self, index: usize) {
-        let Some(fix) = self.pending_fixes.get(index) else {
+        let Some(fix) = self.pending_fixes.get(index).cloned() else {
             return;
-        };
-        let fix = SuggestFix {
-            backspaces: fix.backspaces,
-            text: fix.text.clone(),
-            layout: fix.layout,
         };
         self.hide_suggest_panel();
         if let Some(target) = fix.layout {
@@ -563,7 +562,7 @@ impl TypingPipeline {
     /// Постинг событий; source создан в `install`.
     unsafe fn post_unicode(&self, text: &str) {
         let units: Vec<u16> = text.encode_utf16().collect();
-        for chunk in units.chunks(UNICODE_CHUNK.max(1)) {
+        for chunk in units.chunks(UNICODE_CHUNK) {
             for &down in &[true, false] {
                 let ev = ffi::CGEventCreateKeyboardEvent(self.posting_source, 0, down);
                 if ev.is_null() {
@@ -579,17 +578,25 @@ impl TypingPipeline {
 
 impl Drop for TypingPipeline {
     fn drop(&mut self) {
+        // Null-гарды: в путях ошибки install() часть ресурсов могла быть
+        // не создана — освобождаем только существующие (CFRelease(NULL)
+        // падает, а CFRunLoopRemoveSource с NULL просто недопустима).
         unsafe {
-            ffi::CGEventTapEnable(self.tap_port, false);
-            // Снятие source с main run loop и освобождение ресурсов.
-            ffi::CFRunLoopRemoveSource(
-                ffi::CFRunLoopGetMain(),
-                self.tap_source,
-                ffi::kCFRunLoopCommonModes,
-            );
-            ffi::CFRelease(self.tap_source as ffi::CFTypeRef);
-            ffi::CFRelease(self.tap_port as ffi::CFTypeRef);
-            ffi::CFRelease(self.posting_source as ffi::CFTypeRef);
+            if !self.tap_source.is_null() {
+                ffi::CFRunLoopRemoveSource(
+                    ffi::CFRunLoopGetMain(),
+                    self.tap_source,
+                    ffi::kCFRunLoopCommonModes,
+                );
+                ffi::CFRelease(self.tap_source as ffi::CFTypeRef);
+            }
+            if !self.tap_port.is_null() {
+                ffi::CGEventTapEnable(self.tap_port, false);
+                ffi::CFRelease(self.tap_port as ffi::CFTypeRef);
+            }
+            if !self.posting_source.is_null() {
+                ffi::CFRelease(self.posting_source as ffi::CFTypeRef);
+            }
         }
     }
 }
@@ -776,10 +783,12 @@ mod tests {
 
     #[test]
     fn spell_cfg_clamps() {
-        let mut cfg = Config::default();
-        cfg.spell_suggest = false;
-        cfg.spell_min_chars = 0;
-        cfg.spell_max_suggestions = 42;
+        let cfg = Config {
+            spell_suggest: false,
+            spell_min_chars: 0,
+            spell_max_suggestions: 42,
+            ..Config::default()
+        };
         let s = spell_cfg(&cfg);
         assert!(!s.enabled);
         assert_eq!(s.min_chars, 1);

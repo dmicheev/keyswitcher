@@ -15,6 +15,7 @@
 
 use core::ffi::c_char;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use objc::runtime::Object;
 // `sel`/`sel_impl` нужны самой развёртке макроса msg_send!.
@@ -26,6 +27,12 @@ use crate::macos::ffi;
 type Id = *mut Object;
 
 const NIL: Id = ptr::null_mut();
+
+/// Время жизни кэша `active_window`: за один тик (200 мс) движок и
+/// конвейер печати запрашивают активное окно независимо — AX-обмен
+/// (таймаут до 0.25 c на «глухом» приложении) должен происходить один раз.
+/// Между тиками кэш всегда успевает протухнуть.
+const WINDOW_CACHE_TTL: Duration = Duration::from_millis(100);
 
 /// RAII-обёртка над NSAutoreleasePool: drain при выходе из области видимости.
 pub(crate) struct AutoReleasePool(Id);
@@ -61,6 +68,8 @@ struct KnownSources {
 
 pub struct MacSystem {
     known: KnownSources,
+    /// Кэш последнего запроса активного окна (см. `WINDOW_CACHE_TTL`).
+    window_cache: Option<(Instant, Option<ActiveWindow>)>,
 }
 
 impl Default for MacSystem {
@@ -73,6 +82,7 @@ impl MacSystem {
     pub fn new() -> Self {
         Self {
             known: KnownSources::default(),
+            window_cache: None,
         }
     }
 
@@ -223,10 +233,9 @@ impl MacSystem {
             status == 0
         }
     }
-}
 
-impl System for MacSystem {
-    fn active_window(&mut self) -> Option<ActiveWindow> {
+    /// Реальный запрос активного окна (NSWorkspace + AX). Только main-поток.
+    fn query_active_window(&mut self) -> Option<ActiveWindow> {
         let _pool = AutoReleasePool::new();
         // Safety: AppKit-вызовы на main-потоке; указатели проверяются на nil/null.
         unsafe {
@@ -253,6 +262,21 @@ impl System for MacSystem {
                 title,
             })
         }
+    }
+}
+
+impl System for MacSystem {
+    fn active_window(&mut self) -> Option<ActiveWindow> {
+        // Короткий кэш: повторные запросы в пределах одного тика
+        // (движок + конвейер печати) не ходят в AX повторно.
+        if let Some((t, ref cached)) = self.window_cache {
+            if t.elapsed() < WINDOW_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+        let win = self.query_active_window();
+        self.window_cache = Some((Instant::now(), win.clone()));
+        win
     }
 
     fn current_layout(&mut self) -> Layout {

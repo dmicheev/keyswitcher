@@ -12,13 +12,14 @@
 
 use std::ffi::CString;
 use std::os::raw::c_void;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 
 use crate::macos::event_tap::TypingPipeline;
+use crate::macos::system::AutoReleasePool;
 
 type Id = *mut Object;
 
@@ -70,6 +71,10 @@ impl SuggestPanel {
     #[allow(clippy::new_without_default)]
     pub(crate) fn new() -> Self {
         // Safety: построение панели на main-потоке с живым AppKit.
+        // Пул обязателен: в headless-режиме (`--no-ui`) колбэки тапа
+        // выполняются на «сыром» CFRunLoop, где autoreleased-объекты
+        // (windowBackgroundColor и т.п.) иначе копились бы бесконечно.
+        let _pool = AutoReleasePool::new();
         unsafe {
             let controller: Id = msg_send![picker_class(), new];
             let panel: Id = msg_send![class!(NSPanel), alloc];
@@ -111,7 +116,9 @@ impl SuggestPanel {
     /// Показывает панель у указателя мыши (правее-ниже курсора).
     /// Только main-поток.
     pub(crate) fn show(&mut self, labels: &[String]) {
-        // Safety: работа с AppKit на main-потоке.
+        // Safety: работа с AppKit на main-потоке. Пул — как в new():
+        // autoreleased NSString/шрифты не должны течь в headless-режиме.
+        let _pool = AutoReleasePool::new();
         unsafe {
             self.rebuild_rows(labels);
             let height = ROW_H * labels.len().clamp(1, 9) as f64 + 2.0 * PAD;
@@ -238,22 +245,18 @@ extern "C" fn on_pick_suggestion(this: &mut Object, _cmd: Sel, sender: Id) {
 }
 
 fn picker_class() -> &'static Class {
-    static REGISTER: Once = Once::new();
-    static mut CLASS: Option<&'static Class> = None;
-
-    unsafe {
-        REGISTER.call_once(|| {
-            let mut decl =
-                ClassDecl::new("SuggestPickerController", class!(NSObject)).expect("class decl");
-            decl.add_ivar::<*mut c_void>("pipePtr");
-            decl.add_method(
-                sel!(onPickSuggestion:),
-                on_pick_suggestion as extern "C" fn(&mut Object, Sel, Id),
-            );
-            CLASS = Some(decl.register());
-        });
-        // Читаем через addr_of, чтобы не брать ссылку на static mut.
-        let ptr = std::ptr::addr_of!(CLASS);
-        (*ptr).expect("picker class registered")
-    }
+    // Класс objc не Send/Sync — храним его адрес в OnceLock<usize>
+    // вместо static mut (регистрация идентична и однопоточна: main).
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    let addr = CLASS.get_or_init(|| unsafe {
+        let mut decl =
+            ClassDecl::new("SuggestPickerController", class!(NSObject)).expect("class decl");
+        decl.add_ivar::<*mut c_void>("pipePtr");
+        decl.add_method(
+            sel!(onPickSuggestion:),
+            on_pick_suggestion as extern "C" fn(&mut Object, Sel, Id),
+        );
+        decl.register() as *const Class as usize
+    });
+    unsafe { &*(*addr as *const Class) }
 }

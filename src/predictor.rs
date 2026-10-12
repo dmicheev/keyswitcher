@@ -12,6 +12,10 @@
 //! [`Decision::SwitchAndFix`] — переключить раскладку и заменить уже
 //! набранный префикс. Гистерезис: максимум одно автопереключение на слово.
 //!
+//! Словом считается последовательность клавиш, дающих букву (или дефис/
+//! апостроф) хоть в одной раскладке — так RU-слова с х/ж/б/ю/ъ/ё (клавиши
+//! `[ ; , . ]` и backtick в EN) исправляются и из EN-раскладки.
+//!
 //! Приватность: содержимое буфера не логируется на уровне info (только debug/trace).
 
 use std::sync::{Arc, OnceLock};
@@ -155,7 +159,8 @@ pub struct Conversion {
 /// Слово, зафиксированное по разделителю (для спеллчек-подсказок).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedWord {
-    /// Слово в EN-раскладке (`None`, если не все клавиши буквенные в ней).
+    /// Слово в EN-раскладке (`None`, если не все клавиши производят
+    /// символ в ней; пунктуация «чужой» раскладки допускается).
     pub view_en: Option<String>,
     /// Слово в RU-раскладке.
     pub view_ru: Option<String>,
@@ -176,8 +181,11 @@ pub struct Predictor {
     buffer: Vec<KeyPress>,
     /// Последнее зафиксированное слово (для конвертации по хоткею).
     last_word: Option<Vec<KeyPress>>,
-    /// Разделитель, завершивший последнее слово (' ', '\n', '\t').
-    last_sep: char,
+    /// Символ, идущий в тексте сразу после последнего зафиксированного слова:
+    /// разделитель (space/enter/tab) либо цифра/пунктуация, оборвавшие слово.
+    /// `None` — слово оборвано паузой/функциональной клавишей (контекст у
+    /// курсора неизвестен — конвертация без «лишнего» backspace).
+    last_after: Option<char>,
     /// Зафиксированное слово, ожидающее обработки спеллчеком.
     pending: Option<CommittedWord>,
     /// Сработало ли автопереключение в текущем слове (гистерезис).
@@ -192,7 +200,7 @@ impl Predictor {
             cfg,
             buffer: Vec::new(),
             last_word: None,
-            last_sep: ' ',
+            last_after: None,
             pending: None,
             switched: false,
             last_event: None,
@@ -223,6 +231,7 @@ impl Predictor {
     pub fn forget_last(&mut self) {
         self.buffer.clear();
         self.last_word = None;
+        self.last_after = None;
         self.pending = None;
         self.switched = false;
     }
@@ -253,15 +262,26 @@ impl Predictor {
         self.last_event = Some(now);
 
         let Some((en, ru)) = keymap.chars_for(keycode, shift) else {
-            // Функциональная клавиша — граница слова; реальные разделители
-            // (space/enter/tab) отмечаем для спеллчек-подсказок.
+            // Функциональная клавиша — граница слова. Backspace — правка
+            // набранного: «последнее слово» больше не гарантированно у
+            // курсора, забываем его целиком. Стрелки и прочие клавиши,
+            // двигающие курсор, — то же самое. Реальные разделители
+            // (space/enter/tab) отмечаем для хоткея и спеллчек-подсказок.
+            if keycode == crate::keymap::codes::BACKSPACE {
+                self.forget_last();
+                return Decision::None;
+            }
             let sep = is_separator_key(keycode).then(|| sep_char(keycode));
-            self.commit_with_sep(sep);
+            self.commit_after(sep);
+            if sep.is_none() {
+                // Курсор мог уйти — конвертировать «последнее слово» небезопасно.
+                self.last_word = None;
+            }
             return Decision::None;
         };
-        let current_char = match current_layout {
-            Layout::En => en,
-            Layout::Ru => ru,
+        let (current_char, other_char) = match current_layout {
+            Layout::En => (en, ru),
+            Layout::Ru => (ru, en),
             Layout::Other => {
                 self.commit();
                 return Decision::None;
@@ -273,10 +293,18 @@ impl Predictor {
             return Decision::None;
         };
 
-        if !is_word_char(current_char) {
-            // Цифра/пунктуация в текущей раскладке — слово закончилось;
-            // для спеллчек-подсказок это не «настоящий» разделитель.
-            self.commit_with_sep(None);
+        // Словная клавиша: буква/дефис/апостроф в текущей раскладке ИЛИ в
+        // другой. Второе — клавиши вроде `[` (в RU — «х») или `,` (в RU —
+        // «б»): без них RU-слова с х/ж/б/ю/ъ/ё, набранные в EN-раскладке,
+        // обрывались бы на первой же такой букве и не исправлялись.
+        // Пунктуация в гипотезе чужой раскладки топит её скоринг — ложных
+        // переключений порог switch_threshold не пускает.
+        let word_key = is_word_char(current_char) || other_char.is_some_and(is_word_char);
+        if !word_key {
+            // Цифра/пунктуация в обеих раскладках — слово закончилось.
+            // Запоминаем сам символ: хоткей-конвертация сотрёт и введёт
+            // его обратно, не подменяя пробелом.
+            self.commit_after(Some(current_char));
             return Decision::None;
         }
 
@@ -365,13 +393,19 @@ impl Predictor {
 
     /// Фиксирует текущее слово как «последнее» (для хоткея) и очищает буфер.
     fn commit(&mut self) {
-        self.commit_with_sep(None);
+        self.commit_after(None);
     }
 
-    fn commit_with_sep(&mut self, sep: Option<char>) {
+    /// Фиксирует слово; `after` — символ, идущий в тексте сразу за словом
+    /// (разделитель либо цифра/пунктуация, оборвавшая слово; `None` —
+    /// неизвестно: пауза, функциональная клавиша).
+    fn commit_after(&mut self, after: Option<char>) {
         if !self.buffer.is_empty() {
             let word = std::mem::take(&mut self.buffer);
-            self.last_sep = sep.unwrap_or(' ');
+            // Спеллчек-подсказки показываем только по «настоящему»
+            // разделителю (space/enter/tab).
+            let sep = after.filter(|&c| matches!(c, ' ' | '\n' | '\t'));
+            self.last_after = after;
             self.pending = Some(CommittedWord {
                 view_en: view_of(&word, Layout::En),
                 view_ru: view_of(&word, Layout::Ru),
@@ -386,12 +420,13 @@ impl Predictor {
 
     /// Конвертация последнего слова в другую раскладку (хоткей).
     /// Берёт текущее недонабранное слово, иначе последнее зафиксированное
-    /// (восстанавливая разделитель). `None` — нечего конвертировать.
+    /// (восстанавливая символ-разделитель после него). `None` — нечего
+    /// конвертировать.
     pub fn convert_last_word(&self, current_layout: Layout) -> Option<Conversion> {
-        let (word, extra_sep) = if !self.buffer.is_empty() {
+        let (word, after) = if !self.buffer.is_empty() {
             (self.buffer.as_slice(), None)
         } else {
-            (self.last_word.as_ref()?.as_slice(), Some(self.last_sep))
+            (self.last_word.as_ref()?.as_slice(), self.last_after)
         };
         let target = match current_layout {
             Layout::En => Layout::Ru,
@@ -410,9 +445,9 @@ impl Predictor {
             text.push(c);
         }
         let mut backspaces = word.len();
-        if let Some(sep) = extra_sep {
-            backspaces += 1; // разделитель после слова тоже стираем и вернём
-            text.push(sep);
+        if let Some(c) = after {
+            backspaces += 1; // символ после слова тоже стираем и вернём
+            text.push(c);
         }
         (!text.is_empty()).then_some(Conversion { backspaces, text })
     }
@@ -448,16 +483,19 @@ fn is_separator_key(keycode: u8) -> bool {
 }
 
 /// Слово из нажатых клавиш в заданной раскладке (`None`, если хоть одна
-/// клавиша не отображается в буквенный символ этой раскладки).
+/// клавиша не отображается в символ этой раскладки). Пунктуация чужой
+/// раскладки («[» при RU-гипотезе «х») допускается: словари и n-граммы
+/// оценивают такую гипотезу как мусор сами.
 fn view_of(word: &[KeyPress], layout: Layout) -> Option<String> {
     let mut out = String::with_capacity(word.len());
     for kp in word {
-        let c = match layout {
-            Layout::En => kp.en,
-            Layout::Ru => kp.ru,
-            Layout::Other => None,
-        }?;
-        if !is_word_char(c) {
+        let (c, other) = match layout {
+            Layout::En => (kp.en, kp.ru),
+            Layout::Ru => (kp.ru, kp.en),
+            Layout::Other => return None,
+        };
+        let c = c?;
+        if !(is_word_char(c) || other.is_some_and(is_word_char)) {
             return None;
         }
         out.push(c);
@@ -475,7 +513,7 @@ mod tests {
     const RU_TSV: &str = "\
         как\t1000\nпривет\t500\nпри\t100\nпример\t400\nправда\t300\nвагон\t300\nприват\t250\n\
         математика\t200\nтелевизор\t100\nлето\t250\nулей\t150\nтема\t90\n\
-        планета\t300\nтакси\t400\nмрак\t500\nиврит\t200\n";
+        планета\t300\nтакси\t400\nмрак\t500\nиврит\t200\nсхема\t5000\n";
 
     fn pair() -> Arc<LangPair> {
         LangPair::from_tsv(EN_TSV, RU_TSV)
@@ -686,8 +724,9 @@ mod tests {
         now += Duration::from_millis(50);
         let d = p.feed_key(0x0C, false, Layout::Ru, true, &StaticKeymap, now);
         assert_eq!(d, Decision::None);
-        // Буфер сброшен: «q» в RU — начало нового слова, решений нет.
-        assert!(p.buffer.is_empty() || p.buffer.len() <= 1);
+        // Буфер сброшен: смена раскладки обрывает слово раньше, чем «q»
+        // попадёт в буфер.
+        assert!(p.buffer.is_empty());
     }
 
     #[test]
@@ -855,13 +894,95 @@ mod tests {
         p.feed_key(0x12, false, Layout::En, false, &StaticKeymap, now); // '1'
         let c = p.take_committed().expect("слово зафиксировано цифрой");
         assert_eq!(c.sep, None, "цифра — не разделитель для подсказок");
-        // Хоткей-конвертация по-прежнему считает разделителем пробел.
+        // Хоткей-конвертация стирает «ghb1» и вводит «при1»: цифра
+        // сохраняется, а не подменяется пробелом.
         assert_eq!(
             p.convert_last_word(Layout::En),
             Some(Conversion {
                 backspaces: 4,
-                text: "при ".into()
+                text: "при1".into()
             })
+        );
+    }
+
+    #[test]
+    fn backspace_and_cursor_keys_invalidate_last_word() {
+        // Backspace — правка набранного: «последнее слово» больше не
+        // гарантированно у курсора.
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        type_word(
+            &mut p,
+            "ghbdtn",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        now += Duration::from_millis(50);
+        p.feed_key(
+            crate::keymap::codes::SPACE,
+            false,
+            Layout::En,
+            false,
+            &StaticKeymap,
+            now,
+        );
+        now += Duration::from_millis(50);
+        p.feed_key(
+            crate::keymap::codes::BACKSPACE,
+            false,
+            Layout::En,
+            false,
+            &StaticKeymap,
+            now,
+        );
+        assert_eq!(p.convert_last_word(Layout::En), None);
+
+        // Стрелки и прочие функциональные клавиши двигают курсор — то же.
+        let mut p2 = pred(no_switch_cfg());
+        let mut now2 = t0();
+        type_word(
+            &mut p2,
+            "ghbdtn",
+            Layout::En,
+            &mut now2,
+            Duration::from_millis(50),
+        );
+        now2 += Duration::from_millis(50);
+        p2.feed_key(
+            crate::keymap::codes::SPACE,
+            false,
+            Layout::En,
+            false,
+            &StaticKeymap,
+            now2,
+        );
+        now2 += Duration::from_millis(50);
+        p2.feed_key(0x7A, false, Layout::En, false, &StaticKeymap, now2); // F1
+        assert_eq!(p2.convert_last_word(Layout::En), None);
+    }
+
+    #[test]
+    fn russian_word_with_punct_keys_switches_to_ru() {
+        // «схема» содержит «х» — клавишу, которая в EN-раскладке даёт «[».
+        // Релаксация словных клавиш: буква в чужой раскладке продолжает
+        // слово, гипотеза EN с «[» топится скорингом — переключаемся на RU.
+        let mut p = pred(PredictorConfig::default());
+        let mut now = t0();
+        let ds = type_word(
+            &mut p,
+            "c[tfv",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        assert_eq!(
+            switch_only(&ds),
+            vec![Decision::SwitchAndFix {
+                layout: Layout::Ru,
+                replacement: "схе".into(),
+                typed: 3,
+            }]
         );
     }
 

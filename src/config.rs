@@ -1,8 +1,10 @@
 //! Конфигурация SmartSwitcher.
 //!
 //! Формат файла — простой `ключ = значение`, строки начинающиеся с `#` — комментарии.
-//! Файл лежит рядом с исполняемым файлом (портативный режим):
-//! `<каталог программы>/config.txt`, например `target/release/config.txt`.
+//! Файл лежит в одном месте: `~/.config/smartswitcher/config.txt`
+//! (или `$XDG_CONFIG_HOME/smartswitcher/config.txt`, если переменная задана).
+//! Создаётся автоматически при первом запуске; конфиг из старого
+//! «портативного» расположения (рядом с бинарником) переносится один раз.
 //!
 //! ```text
 //! # Включить автоматическую коррекцию раскладки (EN <-> RU)
@@ -48,14 +50,19 @@ use std::path::{Path, PathBuf};
 
 use crate::keymap;
 
-/// Каталог, в котором лежит сам исполняемый файл: конфиг и журнал
-/// пишутся рядом с программой (портативный режим). Если путь определить
-/// не удалось — текущий каталог процесса.
-pub fn base_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
+/// Каталог конфигурации: одно место для всех данных программы —
+/// `$XDG_CONFIG_HOME/smartswitcher`, иначе `~/.config/smartswitcher`.
+/// Рядом с `config.txt` лежит и журнал (`smartswitcher.log`).
+pub fn config_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("smartswitcher");
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("smartswitcher")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,9 +282,33 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Путь к файлу конфигурации по умолчанию — `config.txt` рядом с программой.
+    /// Путь к файлу конфигурации — `~/.config/smartswitcher/config.txt`.
     pub fn default_path() -> PathBuf {
-        base_dir().join("config.txt")
+        config_dir().join("config.txt")
+    }
+
+    /// Одноразовая миграция из «портативного» расположения (config.txt рядом
+    /// с бинарником): копирует старый файл, только если нового ещё нет.
+    /// Возвращает путь к перенесённому файлу (для журнала).
+    pub fn migrate_portable_config() -> Option<PathBuf> {
+        let new_path = Self::default_path();
+        if new_path.exists() {
+            return None;
+        }
+        let old = std::env::current_exe().ok()?.parent()?.join("config.txt");
+        if !old.exists() {
+            return None;
+        }
+        if let Some(dir) = new_path.parent() {
+            std::fs::create_dir_all(dir).ok()?;
+        }
+        match std::fs::copy(&old, &new_path) {
+            Ok(_) => Some(old),
+            Err(e) => {
+                log::warn!("Не удалось перенести конфиг {old:?}: {e}");
+                None
+            }
+        }
     }
 
     /// Загружает конфигурацию из файла. Если файла нет — возвращает Default.
@@ -313,7 +344,7 @@ impl Config {
         let mut excluded: Vec<String> = self.excluded_apps.iter().cloned().collect();
         excluded.sort();
         format!(
-            "# SmartSwitcher — конфигурация (рядом с бинарником)\n\
+            "# SmartSwitcher — конфигурация ({})\n\
              # Перечитывается на лету раз в 5 секунд, перезапуск не нужен.\n\n\
              # Автоматическая коррекция раскладки под активное окно\n\
              auto_correct = {}\n\n\
@@ -331,15 +362,16 @@ impl Config {
              switch_threshold = {}\n\n\
              # Исправлять уже набранный «неправильный» префикс слова\n\
              retro_fix = {}\n\n\
-              # Горячая клавиша конвертации последнего слова (например ctrl+shift+f13)\n\
-              convert_hotkey = {}\n\n\
-              # Спеллчек-подсказки: после разделителя показывать попап с вариантами\n\
-              # исправления, если слово похоже на опечатку (клик или цифры 1-9)\n\
-              spell_suggest = {}\n\n\
-              # Минимальная длина слова для спеллчек-подсказок\n\
-              spell_min_chars = {}\n\n\
-              # Сколько вариантов исправления показывать (1..9)\n\
-              spell_max_suggestions = {}\n",
+             # Горячая клавиша конвертации последнего слова (например ctrl+shift+f13)\n\
+             convert_hotkey = {}\n\n\
+             # Спеллчек-подсказки: после разделителя показывать попап с вариантами\n\
+             # исправления, если слово похоже на опечатку (клик или цифры 1-9)\n\
+             spell_suggest = {}\n\n\
+             # Минимальная длина слова для спеллчек-подсказок\n\
+             spell_min_chars = {}\n\n\
+             # Сколько вариантов исправления показывать (1..9)\n\
+             spell_max_suggestions = {}\n",
+            config_dir().display(),
             self.auto_correct,
             default,
             self.idle_pause_seconds,
@@ -355,8 +387,11 @@ impl Config {
         )
     }
 
-    /// Сохраняет конфигурацию в файл.
+    /// Сохраняет конфигурацию в файл (каталог создаётся при необходимости).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         std::fs::write(path, self.to_file_string())
     }
 
@@ -371,7 +406,11 @@ impl Config {
             let key = parts.next().unwrap_or("").trim();
             let value = parts.next().unwrap_or("").trim();
             match key {
-                "auto_correct" => cfg.auto_correct = parse_bool(value),
+                "auto_correct" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.auto_correct = b;
+                    }
+                }
                 "default_layout" => {
                     cfg.default_layout = match value.to_ascii_lowercase().as_str() {
                         "en" => DefaultLayout::En,
@@ -389,19 +428,31 @@ impl Config {
                         .filter(|s| !s.is_empty())
                         .collect();
                 }
-                "typing_detect" => cfg.typing_detect = parse_bool(value),
+                "typing_detect" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.typing_detect = b;
+                    }
+                }
                 "min_prefix_chars" => {
                     cfg.min_prefix_chars = value.parse().unwrap_or(cfg.min_prefix_chars)
                 }
                 "switch_threshold" => {
                     cfg.switch_threshold = value.parse().unwrap_or(cfg.switch_threshold)
                 }
-                "retro_fix" => cfg.retro_fix = parse_bool(value),
+                "retro_fix" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.retro_fix = b;
+                    }
+                }
                 "convert_hotkey" => match Hotkey::parse(value) {
                     Some(h) => cfg.convert_hotkey = h,
                     None => log::warn!("Некорректный convert_hotkey '{}', оставлен прежний", value),
                 },
-                "spell_suggest" => cfg.spell_suggest = parse_bool(value),
+                "spell_suggest" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.spell_suggest = b;
+                    }
+                }
                 "spell_min_chars" => {
                     cfg.spell_min_chars = value.parse().unwrap_or(cfg.spell_min_chars)
                 }
@@ -414,23 +465,25 @@ impl Config {
         cfg
     }
 
+    /// Сравнение без учёта регистра (полный Unicode: имена приложений
+    /// могут быть кириллическими, `eq_ignore_ascii_case` их не сводит).
     pub fn is_excluded(&self, app_name: &str) -> bool {
+        let target = app_name.to_lowercase();
         self.excluded_apps
             .iter()
-            .any(|e| e.eq_ignore_ascii_case(app_name))
+            .any(|e| e.to_lowercase() == target)
     }
 }
 
-fn parse_bool(v: &str) -> bool {
+/// Булево значение файла конфигурации. `None` — нераспознанное значение:
+/// как и для чисел, сохраняется прежнее (не выключаем фичу из-за опечатки).
+fn parse_bool(v: &str) -> Option<bool> {
     match v.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
         other => {
-            log::warn!(
-                "Неизвестное логическое значение '{}', используется false",
-                other
-            );
-            false
+            log::warn!("Неизвестное логическое значение '{other}', сохранено прежнее");
+            None
         }
     }
 }
@@ -551,8 +604,8 @@ default_layout = de
 idle_pause_seconds = -5
 ",
         );
-        // auto_correct: неизвестное значение -> false (с предупреждением в лог).
-        assert!(!cfg.auto_correct);
+        // auto_correct: неизвестное значение -> сохранено прежнее (default true).
+        assert!(cfg.auto_correct);
         // default_layout: неизвестная раскладка -> Keep.
         assert_eq!(cfg.default_layout, DefaultLayout::Keep);
         // idle_pause_seconds: не число -> дефолт.
@@ -560,10 +613,39 @@ idle_pause_seconds = -5
     }
 
     #[test]
-    fn test_paths_are_portable_next_to_executable() {
-        // Конфиг и база для журнала лежат в одном каталоге — рядом с бинарём.
-        let base = base_dir();
-        assert_eq!(Config::default_path(), base.join("config.txt"));
+    fn test_parse_bool_garbage_keeps_previous() {
+        // Опечатка в значении не должна молча выключать фичу.
+        let cfg = Config::parse("typing_detect = ture\nretro_fix = flase\n");
+        assert!(cfg.typing_detect);
+        assert!(cfg.retro_fix);
+        // Явные значения работают в обе стороны.
+        let cfg = Config::parse("typing_detect = no\nretro_fix = 0\n");
+        assert!(!cfg.typing_detect);
+        assert!(!cfg.retro_fix);
+    }
+
+    #[test]
+    fn test_excluded_apps_case_insensitive_unicode() {
+        let cfg = Config::parse("exclude_apps = Терминал, 1Password\n");
+        assert!(cfg.is_excluded("терминал"));
+        assert!(cfg.is_excluded("ТЕРМИНАЛ"));
+        assert!(cfg.is_excluded("1password"));
+        assert!(!cfg.is_excluded("Safari"));
+    }
+
+    #[test]
+    fn test_paths_live_in_user_config_dir() {
+        // Конфиг и журнал — в одном месте: ~/.config/smartswitcher
+        // (или $XDG_CONFIG_HOME/smartswitcher).
+        let dir = config_dir();
+        assert_eq!(Config::default_path(), dir.join("config.txt"));
+        let in_home = dir
+            .ancestors()
+            .any(|a| a.file_name().is_some_and(|n| n == ".config"));
+        assert!(
+            in_home || std::env::var_os("XDG_CONFIG_HOME").is_some(),
+            "каталог конфига должен лежать в ~/.config (или XDG): {dir:?}"
+        );
         assert!(Config::default_path().is_absolute());
     }
 

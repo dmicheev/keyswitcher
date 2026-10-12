@@ -14,7 +14,7 @@ use std::ffi::CString;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use objc::declare::ClassDecl;
@@ -504,45 +504,41 @@ fn open_in_default_app(path: &Path) {
 // ---------------------------------------------------------------------------
 
 fn controller_class() -> &'static Class {
-    static REGISTER: Once = Once::new();
-    static mut CLASS: Option<&'static Class> = None;
-
-    unsafe {
-        REGISTER.call_once(|| {
-            let mut decl =
-                ClassDecl::new("SmartSwitcherController", class!(NSObject)).expect("class decl");
-            decl.add_ivar::<*mut c_void>("statePtr");
-            decl.add_method(sel!(tick:), on_tick as extern "C" fn(&mut Object, Sel, Id));
-            decl.add_method(
-                sel!(onToggleLayout:),
-                on_toggle_layout as extern "C" fn(&mut Object, Sel, Id),
-            );
-            decl.add_method(
-                sel!(onOpenSettings:),
-                on_open_settings as extern "C" fn(&mut Object, Sel, Id),
-            );
-            decl.add_method(
-                sel!(onSaveSettings:),
-                on_save_settings as extern "C" fn(&mut Object, Sel, Id),
-            );
-            decl.add_method(
-                sel!(onOpenConfig:),
-                on_open_config as extern "C" fn(&mut Object, Sel, Id),
-            );
-            decl.add_method(
-                sel!(onOpenLog:),
-                on_open_log as extern "C" fn(&mut Object, Sel, Id),
-            );
-            decl.add_method(
-                sel!(onQuit:),
-                on_quit as extern "C" fn(&mut Object, Sel, Id),
-            );
-            CLASS = Some(decl.register());
-        });
-        // Читаем через addr_of, чтобы не брать ссылку на static mut.
-        let ptr = std::ptr::addr_of!(CLASS);
-        (*ptr).expect("controller class registered")
-    }
+    // Класс objc не Send/Sync — храним адрес в OnceLock<usize> вместо
+    // static mut (регистрация однопоточна: main).
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    let addr = CLASS.get_or_init(|| unsafe {
+        let mut decl =
+            ClassDecl::new("SmartSwitcherController", class!(NSObject)).expect("class decl");
+        decl.add_ivar::<*mut c_void>("statePtr");
+        decl.add_method(sel!(tick:), on_tick as extern "C" fn(&mut Object, Sel, Id));
+        decl.add_method(
+            sel!(onToggleLayout:),
+            on_toggle_layout as extern "C" fn(&mut Object, Sel, Id),
+        );
+        decl.add_method(
+            sel!(onOpenSettings:),
+            on_open_settings as extern "C" fn(&mut Object, Sel, Id),
+        );
+        decl.add_method(
+            sel!(onSaveSettings:),
+            on_save_settings as extern "C" fn(&mut Object, Sel, Id),
+        );
+        decl.add_method(
+            sel!(onOpenConfig:),
+            on_open_config as extern "C" fn(&mut Object, Sel, Id),
+        );
+        decl.add_method(
+            sel!(onOpenLog:),
+            on_open_log as extern "C" fn(&mut Object, Sel, Id),
+        );
+        decl.add_method(
+            sel!(onQuit:),
+            on_quit as extern "C" fn(&mut Object, Sel, Id),
+        );
+        decl.register() as *const Class as usize
+    });
+    unsafe { &*(*addr as *const Class) }
 }
 
 // ---------------------------------------------------------------------------

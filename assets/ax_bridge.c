@@ -108,11 +108,6 @@ int ax_bridge_mouse_location(double *out_x, double *out_y) {
     return 1;
 }
 
-/* Проверка: выдано ли приложению право Accessibility. 1 — да. */
-int ax_bridge_is_trusted(void) {
-    return AXIsProcessTrusted() ? 1 : 0;
-}
-
 /*
  * Геометрия дисплеев в тех же «экранных» координатах AX/CG (origin — левый
  * верхний угол ГЛАВНОГО дисплея, y растёт вниз; единицы — поинты).
