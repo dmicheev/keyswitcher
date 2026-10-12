@@ -1,13 +1,14 @@
 //! История копирований в буфер обмена: память + файл на диске.
 //!
-//! Платформо-независимое ядро: хранит последние N записей (новые в начале),
-//! отбрасывает дубликаты (повторное копирование поднимает запись наверх)
-//! и синхронизируется с файлом рядом с `config.txt`
+//! Платформо-независимое ядро: хранит последние N записей — текст и момент
+//! копирования (unix-секунды; показывается в меню, не участвует во вставке),
+//! отбрасывает дубликаты (повторное копирование поднимает запись наверх и
+//! обновляет время) и синхронизируется с файлом рядом с `config.txt`
 //! (`~/.config/smartswitcher/clipboard_history.txt`).
 //!
-//! Формат файла — по одной записи на строку; переводы строк и служебные
-//! символы экранируются (`\\`, `\n`, `\r`, `\t`), поэтому многострочные
-//! копирования переживают сохранение/загрузку без внешних зависимостей.
+//! Формат файла — по одной записи на строку: `<unix-время>\t<текст>`, где
+//! перевод строк и служебные символы текста экранируются (`\\`, `\n`, `\r`,
+//! `\t`). Строки без таба (старый формат) читаются как текст без времени.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufWriter, Write};
@@ -17,10 +18,19 @@ use std::path::Path;
 /// копирования (дампы, base64-файлы) раздули бы и память, и файл.
 const MAX_ENTRY_CHARS: usize = 100_000;
 
+/// Одна запись истории: текст копирования и момент (unix-секунды).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipEntry {
+    pub text: String,
+    /// Момент копирования (unix-время, секунды). `0` — время неизвестно
+    /// (запись из файла старого формата).
+    pub at: u64,
+}
+
 /// История буфера обмена. Новые записи — в начале очереди.
 #[derive(Debug)]
 pub struct ClipboardHistory {
-    entries: VecDeque<String>,
+    entries: VecDeque<ClipEntry>,
     capacity: usize,
 }
 
@@ -52,28 +62,42 @@ impl ClipboardHistory {
     }
 
     /// Записи, от новых к старым.
-    pub fn entries(&self) -> impl Iterator<Item = &str> {
-        self.entries.iter().map(String::as_str)
+    pub fn entries(&self) -> impl Iterator<Item = &ClipEntry> {
+        self.entries.iter()
     }
 
     /// Запись по индексу (0 — самая свежая).
-    pub fn get(&self, index: usize) -> Option<&str> {
-        self.entries.get(index).map(String::as_str)
+    pub fn get(&self, index: usize) -> Option<&ClipEntry> {
+        self.entries.get(index)
     }
 
-    /// Добавляет копирование. Возвращает `true`, если история изменилась.
+    /// Добавляет копирование с моментом `at` (unix-секунды). Возвращает
+    /// `true`, если история изменилась.
     ///
     /// Пропускаются: пустые/пробельные тексты, слишком длинные записи,
-    /// повтор текущей свежей записи. Повтор старой записи поднимает её наверх.
-    pub fn push(&mut self, text: &str) -> bool {
+    /// повтор свежей записи. Повтор старой записи поднимает её наверх
+    /// и обновляет время.
+    pub fn push_at(&mut self, text: &str, at: u64) -> bool {
         if text.trim().is_empty() || text.chars().count() > MAX_ENTRY_CHARS {
             return false;
         }
-        if self.entries.front().map(String::as_str) == Some(text) {
-            return false;
+        if let Some(front) = self.entries.front() {
+            if front.text == text {
+                // Повтор свежей записи: обновляем только время.
+                if front.at == at {
+                    return false;
+                }
+                if let Some(front) = self.entries.front_mut() {
+                    front.at = at;
+                }
+                return true;
+            }
         }
-        self.entries.retain(|e| e != text);
-        self.entries.push_front(text.to_string());
+        self.entries.retain(|e| e.text != text);
+        self.entries.push_front(ClipEntry {
+            text: text.to_string(),
+            at,
+        });
         while self.entries.len() > self.capacity {
             self.entries.pop_back();
         }
@@ -97,7 +121,9 @@ impl ClipboardHistory {
         let mut out = BufWriter::new(file);
         let mut ok = true;
         for entry in &self.entries {
-            ok &= write_escaped_line(&mut out, entry).is_ok();
+            ok &= write!(out, "{}\t", entry.at).is_ok();
+            ok &= write_escaped_body(&mut out, &entry.text).is_ok();
+            ok &= out.write_all(b"\n").is_ok();
         }
         ok &= out.flush().is_ok();
         if !ok {
@@ -116,15 +142,26 @@ impl ClipboardHistory {
             if line.is_empty() {
                 continue;
             }
-            let entry = unescape_line(&line);
+            // Формат: `<unix-время>\t<экранированный текст>` (таб внутри
+            // текста экранирован, разделитель однозначен). Строка без таба —
+            // старый формат: весь текст, время неизвестно (0).
+            let (at, text) = match line.split_once('\t') {
+                Some((head, rest))
+                    if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    (head.parse().unwrap_or(0), rest.to_string())
+                }
+                _ => (0, line.clone()),
+            };
+            let entry = unescape_line(&text);
             // Идём от старых к новым: каждый push кладёт запись наверх.
-            self.entries.push_back(entry);
+            self.entries.push_back(ClipEntry { text: entry, at });
         }
         // Убираем дубликаты (файл мог быть отредактирован руками), оставляя
         // самые свежие: строки идут от новых к старым, первый дубль — новейший.
-        let mut deduped: VecDeque<String> = VecDeque::with_capacity(self.entries.len());
+        let mut deduped: VecDeque<ClipEntry> = VecDeque::with_capacity(self.entries.len());
         for entry in &self.entries {
-            if !deduped.contains(entry) {
+            if !deduped.iter().any(|e| e.text == entry.text) {
                 deduped.push_back(entry.clone());
             }
         }
@@ -135,8 +172,8 @@ impl ClipboardHistory {
     }
 }
 
-/// Экранирует служебные символы и пишет строку записи.
-fn write_escaped_line<W: Write>(out: &mut W, entry: &str) -> std::io::Result<()> {
+/// Экранирует служебные символы записи (без завершающего перевода строки).
+fn write_escaped_body<W: Write>(out: &mut W, entry: &str) -> std::io::Result<()> {
     for c in entry.chars() {
         match c {
             '\\' => out.write_all(b"\\\\")?,
@@ -149,7 +186,7 @@ fn write_escaped_line<W: Write>(out: &mut W, entry: &str) -> std::io::Result<()>
             }
         }
     }
-    out.write_all(b"\n")
+    Ok(())
 }
 
 /// Разбирает строку записи (обратная операция к [`write_escaped_line`]).
@@ -194,49 +231,54 @@ mod tests {
     #[test]
     fn push_skips_empty_and_whitespace() {
         let mut h = ClipboardHistory::new(5);
-        assert!(!h.push(""));
-        assert!(!h.push("   \n\t "));
+        assert!(!h.push_at("", 1));
+        assert!(!h.push_at("   \n\t ", 1));
         assert!(h.is_empty());
     }
 
     #[test]
     fn push_newest_first_and_dedup() {
         let mut h = ClipboardHistory::new(5);
-        assert!(h.push("первый"));
-        assert!(h.push("второй"));
-        assert_eq!(h.get(0), Some("второй"));
-        assert_eq!(h.get(1), Some("первый"));
-        // Повтор свежей записи — ничего не меняется.
-        assert!(!h.push("второй"));
-        // Повтор старой записи поднимает её наверх.
-        assert!(h.push("первый"));
-        assert_eq!(h.get(0), Some("первый"));
-        assert_eq!(h.get(1), Some("второй"));
+        assert!(h.push_at("первый", 100));
+        assert!(h.push_at("второй", 200));
+        assert_eq!(h.get(0).map(|e| e.text.as_str()), Some("второй"));
+        assert_eq!(h.get(1).map(|e| e.text.as_str()), Some("первый"));
+        assert_eq!(h.get(0).map(|e| e.at), Some(200));
+        // Повтор свежей записи с тем же временем — ничего не меняется.
+        assert!(!h.push_at("второй", 200));
+        // Повтор свежей записи с новым временем обновляет время.
+        assert!(h.push_at("второй", 300));
+        assert_eq!(h.get(0).map(|e| e.at), Some(300));
+        // Повтор старой записи поднимает её наверх и обновляет время.
+        assert!(h.push_at("первый", 400));
+        assert_eq!(h.get(0).map(|e| e.text.as_str()), Some("первый"));
+        assert_eq!(h.get(0).map(|e| e.at), Some(400));
+        assert_eq!(h.get(1).map(|e| e.text.as_str()), Some("второй"));
         assert_eq!(h.len(), 2);
     }
 
     #[test]
     fn capacity_trims_oldest() {
         let mut h = ClipboardHistory::new(2);
-        for (i, text) in ["a", "b", "c"].into_iter().enumerate() {
-            assert!(h.push(text), "push #{i}");
+        for (i, (text, at)) in [("a", 1u64), ("b", 2), ("c", 3)].into_iter().enumerate() {
+            assert!(h.push_at(text, at), "push #{i}");
         }
         assert_eq!(h.len(), 2);
-        assert_eq!(h.get(0), Some("c"));
-        assert_eq!(h.get(1), Some("b"));
+        assert_eq!(h.get(0).map(|e| e.text.as_str()), Some("c"));
+        assert_eq!(h.get(1).map(|e| e.text.as_str()), Some("b"));
     }
 
     #[test]
     fn set_capacity_grows_and_shrinks() {
         let mut h = ClipboardHistory::new(3);
-        for text in ["a", "b", "c"] {
-            h.push(text);
+        for (text, at) in [("a", 1u64), ("b", 2), ("c", 3)] {
+            h.push_at(text, at);
         }
         h.set_capacity(1);
         assert_eq!(h.len(), 1);
-        assert_eq!(h.get(0), Some("c"));
+        assert_eq!(h.get(0).map(|e| e.text.as_str()), Some("c"));
         h.set_capacity(10);
-        h.push("d");
+        h.push_at("d", 4);
         assert_eq!(h.len(), 2);
     }
 
@@ -244,37 +286,74 @@ mod tests {
     fn oversized_entries_are_skipped() {
         let mut h = ClipboardHistory::new(5);
         let huge = "x".repeat(MAX_ENTRY_CHARS + 1);
-        assert!(!h.push(&huge));
-        assert!(h.push("ok"));
+        assert!(!h.push_at(&huge, 1));
+        assert!(h.push_at("ok", 1));
         assert_eq!(h.len(), 1);
     }
 
     #[test]
     fn clear_empties_history() {
         let mut h = ClipboardHistory::new(5);
-        h.push("a");
+        h.push_at("a", 1);
         h.clear();
         assert!(h.is_empty());
     }
 
     #[test]
-    fn save_load_roundtrip_with_multiline() {
+    fn save_load_roundtrip_with_multiline_and_time() {
         let path = tmp_path("roundtrip");
         let _ = std::fs::remove_file(&path);
 
         let mut h = ClipboardHistory::new(10);
-        h.push("одна строка");
-        h.push("строка 1\nстрока 2\r\nс табом\t и бэкслешем \\ в конце\n");
-        h.push(" PruF: \\n это буквально бэкслеш-n ");
+        h.push_at("одна строка", 1_700_000_000);
+        h.push_at(
+            "строка 1\nстрока 2\r\nс табом\t и бэкслешем \\ в конце\n",
+            1_700_000_100,
+        );
+        h.push_at(" PruF: \\n это буквально бэкслеш-n ", 1_700_000_200);
         h.save(&path);
 
         let mut loaded = ClipboardHistory::new(10);
         loaded.load(&path);
         assert_eq!(loaded.len(), h.len());
-        let originals: Vec<&str> = h.entries().collect();
-        let restored: Vec<&str> = loaded.entries().collect();
+        let originals: Vec<ClipEntry> = h.entries().cloned().collect();
+        let restored: Vec<ClipEntry> = loaded.entries().cloned().collect();
         assert_eq!(originals, restored);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_old_format_without_time() {
+        let path = tmp_path("old-format");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "без времени\n").expect("write fixture");
+
+        let mut h = ClipboardHistory::new(5);
+        h.load(&path);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.get(0).map(|e| e.text.as_str()), Some("без времени"));
+        assert_eq!(h.get(0).map(|e| e.at), Some(0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn text_starting_with_digits_is_not_confused_with_timestamp() {
+        let path = tmp_path("digits");
+        let _ = std::fs::remove_file(&path);
+        let mut h = ClipboardHistory::new(5);
+        // Время 0 -> строка файла "0\t123-456"; текст "123-456" не время.
+        h.push_at("123-456", 0);
+        h.save(&path);
+        let mut loaded = ClipboardHistory::new(5);
+        loaded.load(&path);
+        assert_eq!(
+            loaded.get(0).map(|e| e.text.as_str()),
+            Some("123-456"),
+            "текст не должен съедаться разбором времени"
+        );
+        assert_eq!(loaded.get(0).map(|e| e.at), Some(0));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -289,8 +368,8 @@ mod tests {
         // Дубликат «a» (первый в файле — самый свежий) остаётся наверху,
         // ёмкость 2: a, b.
         assert_eq!(h.len(), 2);
-        assert_eq!(h.get(0), Some("a"));
-        assert_eq!(h.get(1), Some("b"));
+        assert_eq!(h.get(0).map(|e| e.text.as_str()), Some("a"));
+        assert_eq!(h.get(1).map(|e| e.text.as_str()), Some("b"));
 
         let _ = std::fs::remove_file(&path);
     }

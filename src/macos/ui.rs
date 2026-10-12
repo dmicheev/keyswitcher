@@ -132,6 +132,17 @@ fn layout_label(l: Layout) -> &'static str {
     }
 }
 
+/// Метка пункта меню истории: время копирования и первая строка записи
+/// (до ~60 символов). Время — только для показа, при вставке не используется.
+fn clip_entry_label(entry: &crate::clipboard_history::ClipEntry) -> String {
+    let mut label = clip_time_label(entry.at);
+    if !label.is_empty() {
+        label.push_str("  ");
+    }
+    label.push_str(&entry_label(&entry.text));
+    label
+}
+
 /// Метка пункта меню истории: первая строка записи, до ~60 символов.
 fn entry_label(text: &str) -> String {
     const MAX: usize = 60;
@@ -153,6 +164,44 @@ fn tooltip_text(text: &str) -> String {
         format!("{truncated}…")
     } else {
         text.to_string()
+    }
+}
+
+/// Текущее unix-время в секундах (0 — если часы системы «не идут»).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Человекочитаемое время копирования: «ЧЧ:ММ» для сегодняшних записей,
+/// «ДД.ММ ЧЧ:ММ» — для прошлых дней; пустая строка, если время неизвестно.
+fn clip_time_label(at: u64) -> String {
+    if at == 0 {
+        return String::new();
+    }
+    // Safety: localtime_r с валидным указателем; статических данных не
+    // касаемся (результат — в нашей переменной), вызов на main-потоке.
+    let secs = at as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let now = now_secs() as libc::time_t;
+    let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&secs, &mut tm);
+        libc::localtime_r(&now, &mut now_tm);
+    }
+    let same_day = tm.tm_year == now_tm.tm_year && tm.tm_yday == now_tm.tm_yday;
+    if same_day {
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    } else {
+        format!(
+            "{:02}.{:02} {:02}:{:02}",
+            tm.tm_mday,
+            tm.tm_mon + 1,
+            tm.tm_hour,
+            tm.tm_min
+        )
     }
 }
 
@@ -218,7 +267,7 @@ impl UiState {
         if excluded {
             return;
         }
-        if self.clip.push(&text) {
+        if self.clip.push_at(&text, now_secs()) {
             log::debug!("История буфера: записей={}", self.clip.len());
             self.clip.save(&self.clip_path);
         }
@@ -245,14 +294,11 @@ impl UiState {
                 return;
             }
             for (idx, entry) in self.clip.entries().enumerate() {
-                let item = menu_item(
-                    &entry_label(entry),
-                    controller,
-                    sel!(onPasteClipboard:),
-                    true,
-                );
+                // Дата/время — только для показа: в буфер идёт entry.text.
+                let label = clip_entry_label(entry);
+                let item = menu_item(&label, controller, sel!(onPasteClipboard:), true);
                 let _: () = msg_send![item, setTag: idx as isize];
-                let _: () = msg_send![item, setToolTip: nsstring(&tooltip_text(entry))];
+                let _: () = msg_send![item, setToolTip: nsstring(&tooltip_text(&entry.text))];
                 let _: () = msg_send![menu, addItem: item];
             }
             let sep: Id = msg_send![class!(NSMenuItem), separatorItem];
@@ -380,22 +426,23 @@ extern "C" fn on_menu_needs_update(this: &mut Object, _cmd: Sel, menu: Id) {
 }
 
 /// Клик по записи истории: вернуть её в буфер и сразу вставить в активное
-/// приложение. Сама вставка — с задержкой, чтобы завершилась анимация меню.
+/// приложение. Вставляется только текст записи (время — элемент показа).
+/// Сама вставка — с задержкой, чтобы завершилась анимация меню.
 extern "C" fn on_paste_clipboard(this: &mut Object, _cmd: Sel, sender: Id) {
     let state = state_of(this as *mut Object);
     let tag: isize = unsafe { msg_send![sender, tag] };
     let Some(entry) = (tag >= 0)
         .then(|| state.clip.get(tag as usize))
         .flatten()
-        .map(str::to_string)
+        .map(|e| e.text.clone())
     else {
         return;
     };
-    // Запись кладём в буфер и поднимаем наверх истории; свой же пост
-    // в историю не попадает (changeCount зафиксирован здесь же).
+    // Запись кладём в буфер и поднимаем наверх истории со свежим временем;
+    // свой же пост в историю не попадает (changeCount зафиксирован здесь же).
     if pasteboard::set_string(&entry) {
         state.clip_count = pasteboard::change_count();
-        state.clip.push(&entry);
+        state.clip.push_at(&entry, now_secs());
         state.clip.save(&state.clip_path);
     }
     state.pending_paste = Some(entry);
@@ -925,5 +972,37 @@ mod tests {
         let tip = tooltip_text(&long);
         assert_eq!(tip.chars().count(), 2001);
         assert!(tip.ends_with('…'));
+    }
+
+    #[test]
+    fn clip_time_labels() {
+        // Без времени — пустая метка (в меню только текст).
+        assert_eq!(clip_time_label(0), "");
+        // Сегодняшняя запись — «ЧЧ:ММ».
+        let today = clip_time_label(now_secs());
+        assert_eq!(today.chars().count(), 5, "ожидался формат ЧЧ:ММ: {today}");
+        assert!(today.contains(':'));
+        // Двухдневная давность — «ДД.ММ ЧЧ:ММ» (11 символов).
+        let old = clip_time_label(now_secs() - 2 * 24 * 3600);
+        assert_eq!(
+            old.chars().count(),
+            11,
+            "ожидался формат ДД.ММ ЧЧ:ММ: {old}"
+        );
+    }
+
+    #[test]
+    fn clip_entry_label_shows_time_but_paste_uses_text_only() {
+        use crate::clipboard_history::ClipEntry;
+        let now = now_secs();
+        let entry = ClipEntry {
+            text: "только текст".into(),
+            at: now,
+        };
+        let label = clip_entry_label(&entry);
+        assert!(label.ends_with("только текст"));
+        assert!(label.contains(':'), "в метке должно быть время: {label}");
+        // Сама вставка берёт только text — это контракт get()/onPasteClipboard.
+        assert_eq!(entry.text, "только текст");
     }
 }
