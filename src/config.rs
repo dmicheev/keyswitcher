@@ -261,6 +261,12 @@ pub struct Config {
     pub spell_min_chars: usize,
     /// Сколько вариантов исправления показывать (1..9).
     pub spell_max_suggestions: usize,
+    /// История буфера обмена: сохранять копирования и показывать в меню.
+    pub clipboard_history: bool,
+    /// Сколько последних копирований держать в истории.
+    pub clipboard_history_size: usize,
+    /// Писать журнал в файл (по умолчанию выключено; применяется на старте).
+    pub write_log: bool,
 }
 
 impl Default for Config {
@@ -278,6 +284,9 @@ impl Default for Config {
             spell_suggest: true,
             spell_min_chars: 4,
             spell_max_suggestions: 5,
+            clipboard_history: true,
+            clipboard_history_size: 50,
+            write_log: false,
         }
     }
 }
@@ -372,7 +381,13 @@ impl Config {
              # Минимальная длина слова для спеллчек-подсказок\n\
              spell_min_chars = {}\n\n\
              # Сколько вариантов исправления показывать (1..9)\n\
-             spell_max_suggestions = {}\n",
+              spell_max_suggestions = {}\n\n\
+              # История буфера обмена: сохранять копирования и показывать в меню\n\
+              clipboard_history = {}\n\n\
+              # Сколько последних копирований держать в истории\n\
+              clipboard_history_size = {}\n\n\
+              # Писать журнал в файл (применяется при старте программы)\n\
+              write_log = {}\n",
             config_dir().display(),
             self.auto_correct,
             default,
@@ -386,6 +401,9 @@ impl Config {
             self.spell_suggest,
             self.spell_min_chars,
             self.spell_max_suggestions,
+            self.clipboard_history,
+            self.clipboard_history_size,
+            self.write_log,
         )
     }
 
@@ -461,6 +479,20 @@ impl Config {
                 "spell_max_suggestions" => {
                     cfg.spell_max_suggestions = value.parse().unwrap_or(cfg.spell_max_suggestions)
                 }
+                "clipboard_history" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.clipboard_history = b;
+                    }
+                }
+                "clipboard_history_size" => {
+                    cfg.clipboard_history_size =
+                        value.parse().unwrap_or(cfg.clipboard_history_size).max(1)
+                }
+                "write_log" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.write_log = b;
+                    }
+                }
                 other => log::warn!("Неизвестный параметр конфигурации: '{}'", other),
             }
         }
@@ -512,6 +544,39 @@ mod tests {
         assert!(cfg.spell_suggest);
         assert_eq!(cfg.spell_min_chars, 4);
         assert_eq!(cfg.spell_max_suggestions, 5);
+        // История буфера обмена включена, 50 записей.
+        assert!(cfg.clipboard_history);
+        assert_eq!(cfg.clipboard_history_size, 50);
+        // Журнал по умолчанию НЕ пишется.
+        assert!(!cfg.write_log);
+    }
+
+    #[test]
+    fn test_parse_clipboard_keys() {
+        let cfg = Config::parse(
+            "
+clipboard_history = false
+clipboard_history_size = 10
+",
+        );
+        assert!(!cfg.clipboard_history);
+        assert_eq!(cfg.clipboard_history_size, 10);
+        // Мусорное число и ноль -> прежнее/минимум 1.
+        let cfg = Config::parse(
+            "
+clipboard_history_size = banana
+clipboard_history_size = 0
+",
+        );
+        assert_eq!(cfg.clipboard_history_size, 1);
+    }
+
+    #[test]
+    fn test_parse_write_log() {
+        assert!(Config::parse("write_log = true\n").write_log);
+        assert!(!Config::parse("write_log = no\n").write_log);
+        // Мусорное значение не включает журнал.
+        assert!(!Config::parse("write_log = ture\n").write_log);
     }
 
     #[test]
@@ -669,6 +734,9 @@ idle_pause_seconds = -5
         assert_eq!(parsed.spell_suggest, d.spell_suggest);
         assert_eq!(parsed.spell_min_chars, d.spell_min_chars);
         assert_eq!(parsed.spell_max_suggestions, d.spell_max_suggestions);
+        assert_eq!(parsed.clipboard_history, d.clipboard_history);
+        assert_eq!(parsed.clipboard_history_size, d.clipboard_history_size);
+        assert_eq!(parsed.write_log, d.write_log);
     }
 
     #[test]
@@ -688,6 +756,9 @@ idle_pause_seconds = -5
             spell_suggest: false,
             spell_min_chars: 5,
             spell_max_suggestions: 7,
+            clipboard_history: false,
+            clipboard_history_size: 20,
+            write_log: true,
         };
         let reloaded = Config::parse(&original.to_file_string());
         assert_eq!(reloaded.auto_correct, original.auto_correct);
@@ -705,5 +776,11 @@ idle_pause_seconds = -5
             reloaded.spell_max_suggestions,
             original.spell_max_suggestions
         );
+        assert_eq!(reloaded.clipboard_history, original.clipboard_history);
+        assert_eq!(
+            reloaded.clipboard_history_size,
+            original.clipboard_history_size
+        );
+        assert_eq!(reloaded.write_log, original.write_log);
     }
 }

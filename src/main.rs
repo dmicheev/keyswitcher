@@ -6,6 +6,7 @@
 //! * На других ОС: запускается демонстрационный режим на эмуляторе
 //!   (`src/stub.rs`), чтобы логику можно было проверить/протестировать где угодно.
 
+mod clipboard_history;
 mod config;
 mod dict;
 mod engine;
@@ -66,7 +67,11 @@ pub(crate) fn log_path() -> std::path::PathBuf {
     config::config_dir().join("smartswitcher.log")
 }
 
-fn init_logging() {
+fn init_logging(enabled: bool) {
+    // Журнал по умолчанию выключен: вызовы log:: просто отбрасываются.
+    if !enabled {
+        return;
+    }
     let path = log_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -132,20 +137,21 @@ fn main() {
         return;
     }
 
-    init_logging();
+    // Конфиг нужен до инициализации журнала: писать его или нет — решает
+    // ключ write_log. Сообщение о миграции логируем после инициализации.
     install_signal_handlers();
+    let migrated = Config::migrate_portable_config();
 
-    // Одноразовая миграция конфига из «портативного» расположения
-    // (рядом с бинарником) в ~/.config/smartswitcher.
-    if let Some(old) = Config::migrate_portable_config() {
+    let config_path = Config::default_path();
+    let config = Config::load(&config_path);
+    init_logging(config.write_log);
+
+    if let Some(old) = migrated {
         log::info!(
             "Конфигурация перенесена: {old:?} -> {}",
             Config::default_path().display()
         );
     }
-
-    let config_path = Config::default_path();
-    let config = Config::load(&config_path);
     // Портативный режим: если конфига ещё нет — создаём с текущими
     // значениями по умолчанию, чтобы его можно было править руками.
     if !config_path.exists() {
@@ -155,11 +161,13 @@ fn main() {
         }
     }
     log::info!(
-        "Старт: auto_correct={}, default={:?}, idle={}s, исключений={}",
+        "Старт: auto_correct={}, default={:?}, idle={}s, исключений={}, журнал={}, история буфера={}",
         config.auto_correct,
         config.default_layout,
         config.idle_pause_seconds,
-        config.excluded_apps.len()
+        config.excluded_apps.len(),
+        config.write_log,
+        config.clipboard_history
     );
 
     #[cfg(target_os = "macos")]
@@ -203,7 +211,8 @@ fn print_help() {
           Использование:\n  \
           smartswitcher [--help] [--list-layouts] [--no-ui]\n\n\
           Конфигурация: {}\n\
-          Журнал:       {}\n\n\
+          Журнал:       {}\n\
+          \x20 (не пишется по умолчанию; включите write_log = true в конфиге)\n\n\
           Требуемые разрешения macOS:\n\
           \x20 • Доступность (System Settings → Privacy & Security → Accessibility)\n\
           \x20   — нужна для заголовков окон; без неё переключение работает на уровне приложений.\n\

@@ -901,6 +901,13 @@ impl TypingPipeline {
             ffi::CFRelease(ev as ffi::CFTypeRef);
         }
     }
+
+    /// `true` — идёт буферный конвейер конвертации выделения: он временно
+    /// пишет в буфер обмена свои промежуточные значения, история буфера
+    /// такие записи сохранять не должна.
+    pub fn clip_busy(&self) -> bool {
+        self.clip.is_some()
+    }
 }
 
 impl Drop for TypingPipeline {

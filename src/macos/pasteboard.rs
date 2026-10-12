@@ -11,6 +11,7 @@
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 
+use super::ffi;
 use super::system::{nsstring_to_string, AutoReleasePool};
 
 type Id = *mut Object;
@@ -87,6 +88,31 @@ pub(crate) fn set_string(s: &str) -> bool {
         let _: bool = msg_send![pb, clearContents];
         let ok: bool = msg_send![pb, setString: content forType: ty];
         ok
+    }
+}
+
+/// kVK_ANSI_V — код клавиши V (для эмуляции Cmd+V).
+const KVK_ANSI_V: u16 = 0x09;
+
+/// Эмулирует Cmd+V — вставка в активное приложение.
+/// Вызывать после короткой паузы после закрытия меню (см. UI).
+pub(crate) fn paste_cmd_v() {
+    let _pool = AutoReleasePool::new();
+    // Safety: CoreGraphics-постинг на main-потоке; указатели проверяются на null.
+    unsafe {
+        let source = ffi::CGEventSourceCreate(ffi::KCG_EVENT_SOURCE_STATE_COMBINED);
+        for &down in &[true, false] {
+            let ev = ffi::CGEventCreateKeyboardEvent(source, KVK_ANSI_V, down);
+            if ev.is_null() {
+                continue;
+            }
+            ffi::CGEventSetFlags(ev, ffi::KCG_FLAG_COMMAND);
+            ffi::CGEventPost(ffi::KCG_SESSION_EVENT_TAP, ev);
+            ffi::CFRelease(ev as ffi::CFTypeRef);
+        }
+        if !source.is_null() {
+            ffi::CFRelease(source as ffi::CFTypeRef);
+        }
     }
 }
 
