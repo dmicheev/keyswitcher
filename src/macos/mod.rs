@@ -5,6 +5,7 @@ pub mod event_tap;
 pub mod ffi;
 pub mod headless;
 pub mod keymap;
+pub mod pasteboard;
 pub mod suggest_panel;
 pub mod system;
 pub mod ui;

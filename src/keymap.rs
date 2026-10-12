@@ -35,6 +35,10 @@ pub mod codes {
     pub const ESCAPE: u8 = 0x35;
     /// Caps Lock.
     pub const CAPS_LOCK: u8 = 0x39;
+    /// C (Cmd+C — копирование выделения).
+    pub const KEY_C: u8 = 0x08;
+    /// V (Cmd+V — вставка из буфера обмена).
+    pub const KEY_V: u8 = 0x09;
     /// F13 (дефолтная клавиша конвертации последнего слова).
     pub const F13: u8 = 0x69;
 }

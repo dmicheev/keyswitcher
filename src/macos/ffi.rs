@@ -33,8 +33,8 @@ pub struct CFRunLoopTimerContext {
     pub version: CFIndex,
     pub info: *mut c_void,
     pub retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
-    pub copyDescription: Option<extern "C" fn(*const c_void) -> *const c_void>,
     pub release: Option<extern "C" fn(*const c_void)>,
+    pub copyDescription: Option<extern "C" fn(*const c_void) -> *const c_void>,
 }
 
 pub type CGEventRef = *mut c_void;
@@ -86,6 +86,7 @@ extern "C" {
         context: *const CFRunLoopTimerContext,
     ) -> CFRunLoopTimerRef;
     pub fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
+    pub fn CFRunLoopTimerGetInterval(timer: CFRunLoopTimerRef) -> CFTimeInterval;
     pub fn CFMachPortCreateRunLoopSource(
         allocator: *mut c_void,
         port: CFMachPortRef,
@@ -143,6 +144,7 @@ extern "C" {
     );
     pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     pub fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
+    pub fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
     pub fn CGEventPost(tapLocation: c_int, event: CGEventRef);
 }
 

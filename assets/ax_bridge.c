@@ -89,6 +89,52 @@ void ax_bridge_free(const char *ptr) {
 }
 
 /*
+ * Выделенный текст фокусного элемента процесса pid (kAXSelectedTextAttribute).
+ * Возвращает malloc'ную UTF-8 строку (освободить через ax_bridge_free)
+ * либо NULL, если выделения нет / недоступно (нет прав, «глухое» приложение).
+ */
+char *ax_bridge_copy_selected_text(pid_t pid) {
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (app == NULL) {
+        return NULL;
+    }
+    AXUIElementSetMessagingTimeout(app, (Float32)kAXTimeout);
+
+    AXValueRef winValue = NULL;
+    AXError err = AXUIElementCopyAttributeValue(
+        app, kAXFocusedWindowAttribute, (CFTypeRef *)&winValue);
+    CFRelease(app);
+    if (err != kAXErrorSuccess || winValue == NULL) {
+        return NULL;
+    }
+
+    /* Фокусный элемент внутри окна (текстовое поле с выделением). */
+    AXUIElementRef element = NULL;
+    err = AXUIElementCopyAttributeValue(
+        (AXUIElementRef)winValue, kAXFocusedUIElementAttribute,
+        (CFTypeRef *)&element);
+    CFRelease(winValue);
+    if (err != kAXErrorSuccess || element == NULL) {
+        return NULL;
+    }
+
+    AXValueRef textValue = NULL;
+    err = AXUIElementCopyAttributeValue(
+        element, kAXSelectedTextAttribute, (CFTypeRef *)&textValue);
+    CFRelease(element);
+    if (err != kAXErrorSuccess || textValue == NULL) {
+        return NULL;
+    }
+
+    char *result = NULL;
+    if (CFGetTypeID(textValue) == CFStringGetTypeID()) {
+        result = cfstring_to_utf8_cstr((CFStringRef)textValue);
+    }
+    CFRelease(textValue);
+    return result;
+}
+
+/*
  * Текущая позиция указателя мыши в экранных координатах CG/AX
  * (origin — левый верхний угол главного дисплея, y растёт вниз).
  * Возвращает 1 и заполняет x/y, либо 0.

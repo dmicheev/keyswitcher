@@ -5,8 +5,9 @@
 //! (keyDown + flagsChanged), пропускает события через [`Predictor`] и при
 //! уверенном определении языка переключает раскладку с исправлением уже
 //! набранного префикса (backspace × k + unicode-событие). Отдельно
-//! обрабатывается горячая клавиша конвертации последнего слова — она
-//! работает и при выключенном `typing_detect`. По завершении слова
+//! обрабатывается горячая клавиша конвертации: при активном выделении
+//! конвертируется весь выделенный текст (через AX + ввод поверх выделения),
+//! иначе — последнее слово. Работает и при выключенном `typing_detect`. По завершении слова
 //! разделителем (пробел) неизвестное слово проверяется спеллчеком
 //! ([`crate::spell`]) и при наличии вариантов показывается попап
 //! [`SuggestPanel`]: цифры 1–9 применяют вариант, Esc закрывает.
@@ -26,10 +27,12 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, Hotkey, HotkeyMods};
 use crate::engine::{Layout, System};
 use crate::keymap::codes;
+use crate::layout_convert::LayoutConverter;
 use crate::macos::ffi;
 use crate::macos::keymap::RuntimeKeymap;
+use crate::macos::pasteboard;
 use crate::macos::suggest_panel::SuggestPanel;
-use crate::macos::system::MacSystem;
+use crate::macos::system::{ax_selected_text, MacSystem};
 use crate::predictor::{CommittedWord, Decision, Predictor, PredictorConfig};
 use crate::spell::{self, SpellConfig, SuggestionKind};
 
@@ -40,6 +43,42 @@ const TAP_MASK: ffi::CGEventMask =
 const UNICODE_CHUNK: usize = 20;
 /// Время жизни попапа подсказок без взаимодействия.
 const SUGGEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// Задержка конвертации выделения после нажатия хоткея: колбэк тапа
+/// возвращается сразу, а AX-обмен идёт уже вне тапа (на main run loop).
+const CONVERT_DELAY: f64 = 0.05;
+/// Верхняя граница размера выделения для конвертации: замена длинного текста
+/// посимвольным вводом становится заметно медленной.
+const MAX_SELECTION_CHARS: usize = 10_000;
+/// Ожидание копирования (Cmd+C → смена буфера): не изменился — выделения нет.
+const CLIP_COPY_TIMEOUT: Duration = Duration::from_millis(400);
+/// Интервал опроса буфера обмена в фазе копирования/восстановления.
+const CLIP_POLL_INTERVAL: f64 = 0.03;
+/// Задержка перед восстановлением буфера после Cmd+V (приложение читает
+/// буфер асинхронно — ранняя замена вставила бы старый текст).
+const CLIP_RESTORE_DELAY: Duration = Duration::from_millis(350);
+
+/// Режим буферного конвейера конвертации выделения.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipPhase {
+    /// Скопировали (Cmd+C), ждём изменения буфера.
+    Copy,
+    /// Записали конверт, отправили Cmd+V, ждём вставки перед восстановлением.
+    Paste,
+}
+
+/// Состояние асинхронной конвертации выделения через буфер обмена.
+struct ClipConvert {
+    phase: ClipPhase,
+    /// Буфер до копирования: строка — восстановим после вставки,
+    /// `None` — не-строковое содержимое (не умеем сохранять).
+    old_string: Option<String>,
+    /// Счётчик изменений до нашего Cmd+C.
+    old_count: isize,
+    /// Счётчик после нашей записи конверта (защита восстановления).
+    our_count: isize,
+    /// Дедлайн текущей фазы (ожидание копирования / восстановление).
+    deadline: Instant,
+}
 
 /// «Рецепт» применения варианта исправления.
 #[derive(Debug, Clone)]
@@ -56,6 +95,8 @@ struct SuggestFix {
 pub struct TypingPipeline {
     predictor: Predictor,
     keymap: RuntimeKeymap,
+    /// Конвертер текста EN↔RU (для выделенного текста).
+    converter: LayoutConverter,
     system: MacSystem,
     /// Проекция конфигурации, обновляется из tick().
     typing_detect: bool,
@@ -92,6 +133,11 @@ pub struct TypingPipeline {
     own_exe: Option<String>,
     /// «Взведён» ли тап модификатора (модификаторы нажаты без других клавиш).
     mod_tap_armed: bool,
+    /// Таймер конвертации: one-shot (отложенный старт после хоткея) либо
+    /// повторяющийся (опрос буфера обмена); `null` — не запланирован.
+    convert_timer: ffi::CFRunLoopTimerRef,
+    /// Активная конвертация выделения через буфер обмена (`None` — нет).
+    clip: Option<ClipConvert>,
 }
 
 impl TypingPipeline {
@@ -112,12 +158,15 @@ impl TypingPipeline {
         // раньше, чем его source добавлен в run loop. Владение ресурсами —
         // у структуры: в путях ошибки Drop освобождает только созданное
         // (null-поля пропускаются), ручных CFRelease здесь нет.
+        let keymap = RuntimeKeymap::build();
+        let converter = LayoutConverter::new(&keymap);
         let mut pipeline = Box::new(Self {
             predictor: Predictor::new(
                 crate::predictor::LangPair::load_embedded(),
                 predictor_cfg(config),
             ),
-            keymap: RuntimeKeymap::build(),
+            keymap,
+            converter,
             system: MacSystem::new(),
             typing_detect: config.typing_detect,
             retro_fix: config.retro_fix,
@@ -139,6 +188,8 @@ impl TypingPipeline {
                 .ok()
                 .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())),
             mod_tap_armed: false,
+            convert_timer: core::ptr::null_mut(),
+            clip: None,
         });
         // Клик по кнопке попапа должен попасть в конвейер: адрес аллокации
         // Box стабилен, пока конвейер жив.
@@ -322,7 +373,7 @@ impl TypingPipeline {
         // 4. Хоткей конвертации работает всегда (модификаторы сверяем точно).
         if self.hotkey_matches(keycode) {
             log::debug!("хоткей: нажатие распознано (keycode={keycode:#x})");
-            self.convert_last_word();
+            self.request_convert();
             return event;
         }
 
@@ -474,6 +525,245 @@ impl TypingPipeline {
         log::info!("Режим печати: подсказка применена");
     }
 
+    /// Хоткей конвертации: при активном выделении — конвертация всего
+    /// выделенного текста (Punto-стиль), иначе — последнего слова.
+    /// AX-обмен в колбэке тапа недопустим (синхронный обмен тормозит печать),
+    /// поэтому работа планируется one-shot таймером main run loop.
+    fn request_convert(&mut self) {
+        if !self.convert_timer.is_null() || self.clip.is_some() {
+            return; // конвертация уже идёт
+        }
+        if self.arm_convert_timer(CONVERT_DELAY, 0.0) {
+            return;
+        }
+        self.convert_selection_or_word();
+    }
+
+    /// Создаёт таймер конвертации (`interval == 0` — one-shot) и добавляет
+    /// в main run loop. `false` — создать не удалось (конвертация выполняется
+    /// синхронно вызывающим).
+    fn arm_convert_timer(&mut self, fire_delay: f64, interval: f64) -> bool {
+        if !self.convert_timer.is_null() {
+            return true;
+        }
+        let info = self as *const TypingPipeline as *mut core::ffi::c_void;
+        let context = ffi::CFRunLoopTimerContext {
+            version: 0,
+            info,
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        let timer = unsafe {
+            ffi::CFRunLoopTimerCreate(
+                core::ptr::null_mut(),
+                ffi::CFAbsoluteTimeGetCurrent() + fire_delay,
+                interval,
+                0,
+                0,
+                convert_timer_callback,
+                &context,
+            )
+        };
+        if timer.is_null() {
+            return false;
+        }
+        unsafe {
+            ffi::CFRunLoopAddTimer(ffi::CFRunLoopGetMain(), timer, ffi::kCFRunLoopCommonModes);
+        }
+        self.convert_timer = timer;
+        true
+    }
+
+    /// Останавливает и освобождает таймер конвертации.
+    fn stop_convert_timer(&mut self) {
+        if self.convert_timer.is_null() {
+            return;
+        }
+        unsafe {
+            ffi::CFRunLoopTimerInvalidate(self.convert_timer);
+            ffi::CFRelease(self.convert_timer as ffi::CFTypeRef);
+        }
+        self.convert_timer = core::ptr::null_mut();
+    }
+
+    /// Срабатывание таймера конвертации (main run loop, вне колбэка тапа).
+    fn on_convert_timer(&mut self) {
+        if self.clip.is_some() {
+            self.on_clip_poll();
+        } else {
+            // Первый (отложенный) выстрел: пробуем выделение.
+            self.convert_selection_or_word();
+        }
+    }
+
+    /// Конвертация выделения; при отсутствии выделения — последнего слова.
+    fn convert_selection_or_word(&mut self) {
+        if self.convert_selection() {
+            return;
+        }
+        if self.start_clip_convert() {
+            return;
+        }
+        self.convert_last_word();
+    }
+
+    /// Конвертация выделенного текста в другую раскладку: читаем выделение
+    /// через AX, конвертируем посимвольно и вводим поверх (набор заменяет
+    /// выделение — без буфера обмена). `true` — выделение сконвертировано.
+    fn convert_selection(&mut self) -> bool {
+        if self.excluded {
+            return false;
+        }
+        let Some(pid) = self.system.frontmost_pid() else {
+            return false;
+        };
+        let Some(selected) = ax_selected_text(pid) else {
+            log::debug!("выделение: недоступно через AX — пробую буфер обмена");
+            return false;
+        };
+        let chars = selected.chars().count();
+        if chars > MAX_SELECTION_CHARS {
+            log::debug!("выделение: слишком длинное ({chars} символов), пропускаю");
+            return false;
+        }
+        self.apply_converted(
+            &selected,
+            &format!("хоткей: конвертация выделения ({chars} симв.)"),
+        )
+    }
+
+    /// Запускает конвертацию выделения через буфер обмена (для приложений,
+    /// где AX выделение не отдаёт: Terminal, Electron и т.п.): Cmd+C → ждём
+    /// смену буфера → конвертация → Cmd+V → восстановление буфера.
+    /// `true` — конвейер запущен (завершится асинхронно).
+    fn start_clip_convert(&mut self) -> bool {
+        if self.clip.is_some() || self.excluded {
+            return false;
+        }
+        let Some(count) = pasteboard::change_count() else {
+            log::debug!("выделение: буфер обмена недоступен");
+            return false;
+        };
+        self.clip = Some(ClipConvert {
+            phase: ClipPhase::Copy,
+            old_string: pasteboard::string(),
+            old_count: count,
+            our_count: count,
+            deadline: Instant::now() + CLIP_COPY_TIMEOUT,
+        });
+        unsafe { self.post_cmd_key(codes::KEY_C) };
+        if !self.arm_convert_timer(CLIP_POLL_INTERVAL, CLIP_POLL_INTERVAL) {
+            self.clip = None;
+            return false;
+        }
+        log::debug!("выделение: копирую через буфер обмена (Cmd+C)");
+        true
+    }
+
+    /// Очередной опрос буферного конвейера: фаза Copy — ждём содержимое
+    /// выделения; фаза Paste — ждём вставки и восстанавливаем буфер.
+    fn on_clip_poll(&mut self) {
+        let Some(mut clip) = self.clip.take() else {
+            self.stop_convert_timer();
+            return;
+        };
+        match clip.phase {
+            ClipPhase::Copy => {
+                let count = pasteboard::change_count().unwrap_or(clip.old_count);
+                if count != clip.old_count {
+                    let copied = pasteboard::string();
+                    match copied.as_deref().and_then(|s| self.converter.convert(s)) {
+                        Some((converted, target)) => {
+                            if !pasteboard::set_string(&converted) {
+                                log::warn!("выделение: не удалось записать буфер обмена");
+                                self.stop_convert_timer();
+                                return;
+                            }
+                            clip.our_count = pasteboard::change_count().unwrap_or(count);
+                            clip.phase = ClipPhase::Paste;
+                            clip.deadline = Instant::now() + CLIP_RESTORE_DELAY;
+                            // В терминалах Cmd+V вставляет в позицию каретки,
+                            // игнорируя выделение (в отличие от текстовых
+                            // редакторов), — сначала удаляем выделение Backspace.
+                            // Если приложение сняло выделение при копировании
+                            // (редкая экзотика), пострадает один символ перед
+                            // кареткой — поэтому список терминалов, а не все
+                            // приложения буферного пути.
+                            let is_terminal = self
+                                .current_app
+                                .as_ref()
+                                .is_some_and(|(id, name)| is_terminal_like(id, name));
+                            if is_terminal {
+                                unsafe { self.post_backspaces(1) };
+                            }
+                            unsafe { self.post_cmd_key(codes::KEY_V) };
+                            if !self.system.set_layout(target) {
+                                log::warn!(
+                                    "выделение: не удалось переключить раскладку на {target:?}"
+                                );
+                            }
+                            // Наше переключение не должно выглядеть ручной сменой.
+                            self.last_layout = Some(target);
+                            self.predictor.forget_last();
+                            log::info!(
+                                "хоткей: конвертация выделения через буфер ({}) -> {target:?}",
+                                converted.chars().count()
+                            );
+                            self.clip = Some(clip);
+                        }
+                        None => {
+                            // Выделение есть, но конвертировать нечего; backspace
+                            // последнего слова разрушил бы выделение — выходим.
+                            log::debug!("выделение: конвертировать нечего");
+                            self.stop_convert_timer();
+                        }
+                    }
+                } else if Instant::now() >= clip.deadline {
+                    // Буфер не изменился — выделения нет: обычная конвертация слова.
+                    log::debug!("выделение: буфер не изменился — нет выделения");
+                    self.stop_convert_timer();
+                    self.convert_last_word();
+                } else {
+                    self.clip = Some(clip);
+                }
+            }
+            ClipPhase::Paste => {
+                if Instant::now() >= clip.deadline {
+                    // Восстанавливаем прежний буфер, если после нашей записи
+                    // туда больше ничего не писали.
+                    if let Some(old) = clip.old_string {
+                        if pasteboard::change_count() == Some(clip.our_count) {
+                            pasteboard::set_string(&old);
+                            log::debug!("выделение: буфер обмена восстановлен");
+                        }
+                    }
+                    self.stop_convert_timer();
+                } else {
+                    self.clip = Some(clip);
+                }
+            }
+        }
+    }
+
+    /// Конвертирует `selected` и вводит поверх выделения; общая часть
+    /// AX-пути. `label` — для журнала. `true` — сконвертировано.
+    fn apply_converted(&mut self, selected: &str, label: &str) -> bool {
+        let Some((converted, target)) = self.converter.convert(selected) else {
+            log::debug!("выделение: конвертировать нечего");
+            return false;
+        };
+        unsafe { self.post_unicode(&converted) };
+        if !self.system.set_layout(target) {
+            log::warn!("выделение: не удалось переключить раскладку на {target:?}");
+        }
+        // Наше переключение не должно выглядеть ручной сменой.
+        self.last_layout = Some(target);
+        self.predictor.forget_last();
+        log::info!("{label} -> {target:?}");
+        true
+    }
+
     /// Хоткей-конвертация последнего слова в другую раскладку
     /// (с переключением раскладки — как Punto).
     fn convert_last_word(&mut self) {
@@ -548,7 +838,7 @@ impl TypingPipeline {
                 let any_hotkey_mod = cur & hotkey_mod_mask(self.hotkey.mods) != 0;
                 if self.mod_tap_armed && !any_hotkey_mod {
                     log::debug!("хоткей: тап модификатора");
-                    self.convert_last_word();
+                    self.request_convert();
                 }
                 self.mod_tap_armed = false;
             }
@@ -595,6 +885,22 @@ impl TypingPipeline {
             }
         }
     }
+
+    /// Нажатие клавиши с Cmd (Cmd+C / Cmd+V) — пара keyDown/keyUp.
+    ///
+    /// # Safety
+    /// Постинг событий; source создан в `install`.
+    unsafe fn post_cmd_key(&self, keycode: u8) {
+        for &down in &[true, false] {
+            let ev = ffi::CGEventCreateKeyboardEvent(self.posting_source, u16::from(keycode), down);
+            if ev.is_null() {
+                continue;
+            }
+            ffi::CGEventSetFlags(ev, ffi::KCG_FLAG_COMMAND);
+            ffi::CGEventPost(ffi::KCG_SESSION_EVENT_TAP, ev);
+            ffi::CFRelease(ev as ffi::CFTypeRef);
+        }
+    }
 }
 
 impl Drop for TypingPipeline {
@@ -603,6 +909,10 @@ impl Drop for TypingPipeline {
         // не создана — освобождаем только существующие (CFRelease(NULL)
         // падает, а CFRunLoopRemoveSource с NULL просто недопустима).
         unsafe {
+            if !self.convert_timer.is_null() {
+                ffi::CFRunLoopTimerInvalidate(self.convert_timer);
+                ffi::CFRelease(self.convert_timer as ffi::CFTypeRef);
+            }
             if !self.tap_source.is_null() {
                 ffi::CFRunLoopRemoveSource(
                     ffi::CFRunLoopGetMain(),
@@ -619,6 +929,29 @@ impl Drop for TypingPipeline {
                 ffi::CFRelease(self.posting_source as ffi::CFTypeRef);
             }
         }
+    }
+}
+
+/// Колбэк таймера конвертации (C ABI). One-shot (interval == 0) — отложенный
+/// старт: снимаем таймер, возвращаем владение и конвертируем. Повторяющийся —
+/// опрос буферного конвейера: таймер продолжает тикать, остановит его сам
+/// `on_clip_poll` через поле `convert_timer`.
+extern "C" fn convert_timer_callback(timer: ffi::CFRunLoopTimerRef, info: *mut core::ffi::c_void) {
+    if info.is_null() {
+        return;
+    }
+    // Safety: указатель валиден, пока жив TypingPipeline (main-поток).
+    let pipeline: &mut TypingPipeline = unsafe { &mut *(info as *mut TypingPipeline) };
+    let one_shot = unsafe { ffi::CFRunLoopTimerGetInterval(timer) } == 0.0;
+    if one_shot {
+        pipeline.convert_timer = core::ptr::null_mut();
+        unsafe {
+            ffi::CFRunLoopTimerInvalidate(timer);
+            ffi::CFRelease(timer as ffi::CFTypeRef);
+        }
+        pipeline.convert_selection_or_word();
+    } else {
+        pipeline.on_convert_timer();
     }
 }
 
@@ -721,6 +1054,25 @@ fn is_own_app(app_id: &str, app_name: &str, own_exe: Option<&str>) -> bool {
     own_exe.is_some_and(|exe| app_name.eq_ignore_ascii_case(exe))
 }
 
+/// Терминалы: Cmd+V вставляет в позицию каретки, не заменяя выделение,
+/// поэтому буферному пути нужен Backspace перед вставкой. Определяем по
+/// характерным частям bundle id / имени (регистр не важен).
+fn is_terminal_like(app_id: &str, app_name: &str) -> bool {
+    const MARKS: [&str; 8] = [
+        "terminal",
+        "iterm",
+        "kitty",
+        "alacritty",
+        "wezterm",
+        "warp",
+        "hyper",
+        "ghostty",
+    ];
+    let id = app_id.to_ascii_lowercase();
+    let name = app_name.to_lowercase();
+    MARKS.iter().any(|m| id.contains(m) || name.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +1096,25 @@ mod tests {
             "Safari",
             Some("smartswitcher")
         ));
+    }
+
+    #[test]
+    fn terminal_like_detection() {
+        assert!(is_terminal_like("com.apple.Terminal", "Terminal"));
+        assert!(is_terminal_like("com.googlecode.iterm2", "iTerm2"));
+        assert!(is_terminal_like("net.kovidgoyal.kitty", "kitty"));
+        assert!(is_terminal_like("io.alacritty", "Alacritty"));
+        assert!(is_terminal_like("dev.warp.Warp-Stable", "Warp"));
+        assert!(is_terminal_like("com.mitchellh.ghostty", "Ghostty"));
+        // Редакторы и браузеры — не терминалы.
+        assert!(!is_terminal_like("com.apple.TextEdit", "TextEdit"));
+        assert!(!is_terminal_like("com.google.Chrome", "Chrome"));
+        assert!(!is_terminal_like(
+            "com.microsoft.VSCode",
+            "Visual Studio Code"
+        ));
+        // «Terminal» внутри чужого имени не должен проходить по пустой строке.
+        assert!(!is_terminal_like("", ""));
     }
 
     #[test]

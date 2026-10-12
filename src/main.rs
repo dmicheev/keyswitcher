@@ -10,6 +10,7 @@ mod config;
 mod dict;
 mod engine;
 mod keymap;
+mod layout_convert;
 mod ngram;
 mod predictor;
 mod short_words;
@@ -208,7 +209,8 @@ fn print_help() {
           \x20   — нужна для заголовков окон; без неё переключение работает на уровне приложений.\n\
           \x20   — она же нужна режиму печати (CGEventTap); без неё функция отключается.\n\n\
           Режим печати (typing_detect в config.txt): автопереключение EN<->RU по ходу\n\
-          набора + хоткей конвертации последнего слова (convert_hotkey, по умолчанию F13).\n\n\
+          набора + хоткей конвертации последнего слова либо всего выделенного\n\
+          \x20 текста (convert_hotkey, по умолчанию тап Option).\n\n\
           Переключение использует только ВКЛЮЧЁННЫЕ источники ввода\n\
           \x20 (System Settings → Keyboard → Input Sources); список: --list-layouts\n\n\
           Автозапуск: examples/com.smartswitcher.agent.plist (launchd)",

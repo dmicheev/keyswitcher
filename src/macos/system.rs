@@ -263,6 +263,25 @@ impl MacSystem {
             })
         }
     }
+
+    /// PID фронтового приложения (NSWorkspace). Только main-поток.
+    /// `None` — фронтовое приложение не определено.
+    pub fn frontmost_pid(&mut self) -> Option<i64> {
+        let _pool = AutoReleasePool::new();
+        // Safety: AppKit-вызовы на main-потоке; указатели проверяются на nil.
+        unsafe {
+            let ws: Id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            if ws == NIL {
+                return None;
+            }
+            let app: Id = msg_send![ws, frontmostApplication];
+            if app == NIL {
+                return None;
+            }
+            let pid: i64 = msg_send![app, processIdentifier];
+            (pid > 0).then_some(pid)
+        }
+    }
 }
 
 impl System for MacSystem {
@@ -312,6 +331,8 @@ impl System for MacSystem {
 extern "C" {
     /// Заголовок фокусного окна процесса `pid` (malloc'ная UTF-8 строка) или NULL.
     fn ax_bridge_copy_title(pid: i32) -> *const c_char;
+    /// Выделенный текст фокусного элемента `pid` (malloc'ная UTF-8 строка) или NULL.
+    fn ax_bridge_copy_selected_text(pid: i32) -> *const c_char;
     fn ax_bridge_free(ptr: *const c_char);
     /// Позиция указателя мыши в экранных координатах CG/AX.
     fn ax_bridge_mouse_location(out_x: *mut f64, out_y: *mut f64) -> i32;
@@ -362,6 +383,21 @@ unsafe fn ax_bridge_title(pid: i64) -> Option<String> {
     let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
     ax_bridge_free(p);
     (!s.is_empty()).then_some(s)
+}
+
+/// Выделенный текст фокусного элемента процесса `pid` (через AX).
+/// `None` — выделения нет либо недоступен (нет разрешения, «глухое» приложение).
+pub(crate) fn ax_selected_text(pid: i64) -> Option<String> {
+    // Safety: указатель из ax_bridge_copy_selected_text валиден до ax_bridge_free.
+    unsafe {
+        let p = ax_bridge_copy_selected_text(pid as i32);
+        if p.is_null() {
+            return None;
+        }
+        let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+        ax_bridge_free(p);
+        (!s.is_empty()).then_some(s)
+    }
 }
 
 /// # Safety: `s` должен быть валидным указателем на NSString или NULL.

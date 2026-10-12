@@ -1,21 +1,30 @@
 # Makefile для keyswitcher (smartswitcher)
 # Сборка, отладка и упаковка в самостоятельный .app-бандл для macOS.
 #
-# Примечание: бандл подписывается ad-hoc (--sign -). После каждой пересборки
-# macOS может заново запросить разрешение «Доступность» (Accessibility),
-# т.к. подпись (и TCC-идентичность) меняется.
+# Подпись: TCC хранит разрешение «Доступность» (Accessibility) по кодовой
+# подписи. Ad-hoc-подпись меняется при каждой пересборке — macOS считает
+# бандл «другим» приложением и просит выдать разрешение заново. Чтобы
+# разрешение переживало пересборки, один раз выполните `make cert`:
+# бандл начнёт подписываться self-signed сертификатом (CODESIGN_ID) со
+# стабильной TCC-идентичностью. Без сертификата используется ad-hoc.
 
 APP_NAME    := Smartswitcher
 BIN_NAME    := smartswitcher
 BUNDLE_ID   := ru.dimka.smartswitcher
 VERSION     := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 
+# Имя self-signed сертификата подписи (создаётся один раз: make cert).
+# Можно переопределить, например, на "Apple Development: ..." при желании.
+CODESIGN_ID ?= smartswitcher-dev
+# Если идентичность найдена в связке ключей — подписываем ею, иначе ad-hoc.
+SIGN_ID := $(shell security find-identity -p codesigning -v 2>/dev/null | grep -qF '$(CODESIGN_ID)' && echo '$(CODESIGN_ID)' || echo '-')
+
 RELEASE_BIN := target/release/$(BIN_NAME)
 DEBUG_BIN   := target/debug/$(BIN_NAME)
 BUNDLE_ROOT := build
 APP_BUNDLE  := $(BUNDLE_ROOT)/$(APP_NAME).app
 
-.PHONY: help build debug run lldb test fmt clippy check release bundle install uninstall run-bundle stop-bundle clean dicts
+.PHONY: help build debug run lldb test fmt clippy check release bundle install uninstall run-bundle stop-bundle reset-tcc cert clean dicts
 
 .DEFAULT_GOAL := help
 
@@ -31,8 +40,10 @@ help:
 	@echo "  make clippy       - линтер (cargo clippy)"
 	@echo "  make check        - fmt --check + clippy + тесты"
 	@echo "  make release      - релизная сборка (optimized)"
+	@echo "  make cert         - ОДИН РАЗ: self-signed сертификат подписи ($(CODESIGN_ID))"
 	@echo "  make bundle       - релиз + самостоятельный $(APP_NAME).app (без консоли)"
 	@echo "  make install      - установка бандла в /Applications"
+	@echo "  make reset-tcc    - сброс записи «Доступность» для $(BUNDLE_ID) (sudo)"
 	@echo "  make run-bundle   - запуск установленного/локального бандла (open)"
 	@echo "  make stop-bundle  - остановка запущенного агента"
 	@echo "  make uninstall    - удаление из /Applications"
@@ -96,14 +107,33 @@ bundle: release
 	@printf '  <key>NSSupportsSuddenTermination</key><false/>\n' >> "$(APP_BUNDLE)/Contents/Info.plist"
 	@printf '</dict>\n</plist>\n' >> "$(APP_BUNDLE)/Contents/Info.plist"
 	@plutil -lint "$(APP_BUNDLE)/Contents/Info.plist"
-	@codesign --force --sign - "$(APP_BUNDLE)"
+	@echo "Подпись бандла: $(SIGN_ID)"
+	@codesign --force --sign '$(SIGN_ID)' "$(APP_BUNDLE)"
 	@echo "Готово: $(APP_BUNDLE) ($(VERSION))"
 
 install: bundle
 	@rm -rf "/Applications/$(APP_NAME).app"
 	@cp -R "$(APP_BUNDLE)" /Applications/
 	@echo "Установлено: /Applications/$(APP_NAME).app"
-	@echo "Не забудьте выдать разрешение: Системные настройки -> Конфиденциальность и безопасность -> Доступность"
+	@if [ "$(SIGN_ID)" = "-" ]; then \
+		echo "ВНИМАНИЕ: бандл подписан ad-hoc — после каждой пересборки придётся заново"; \
+		echo "выдавать «Доступность». Один раз выполните: make cert && make install."; \
+	else \
+		echo "Подпись стабильная ($(SIGN_ID)): выдайте «Доступность» один раз —"; \
+		echo "последующие пересборки разрешение сохранят."; \
+	fi
+	@echo "Выдача разрешения: Системные настройки -> Конфиденциальность и безопасность -> Доступность."
+
+# Одноразовое создание self-signed сертификата подписи (см. шапку файла).
+cert:
+	sh tools/codesign/make-cert.sh '$(CODESIGN_ID)'
+
+# Сброс устаревшей TCC-записи «Доступность» (например, после перехода
+# с ad-hoc на стабильную подпись). Нужен пароль администратора.
+reset-tcc:
+	@echo "Сброс записи «Доступность» для $(BUNDLE_ID) (нужен пароль администратора)..."
+	@sudo tccutil reset Accessibility $(BUNDLE_ID) \
+		|| echo "Не получилось — удалите $(APP_NAME) из списка «Доступность» вручную."
 
 uninstall:
 	@rm -rf "/Applications/$(APP_NAME).app"
