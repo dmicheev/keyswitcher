@@ -1330,6 +1330,8 @@ mod calibrate_real {
             ("jdk", Layout::En),
             ("qwe", Layout::En),
             ("abc", Layout::En),
+            ("nfv", Layout::En), // там
+            ("ghb", Layout::En), // при (префикс «при...»)
             ("ghbdtn", Layout::Ru),
             ("shspev", Layout::En),
             ("vjybnth", Layout::En),
