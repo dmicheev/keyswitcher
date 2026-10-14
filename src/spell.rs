@@ -1,7 +1,8 @@
 //! Спеллчек и подбор вариантов исправления для попапа-подсказки.
 //!
-//! Вызывается по завершении слова (разделитель): если слово отсутствует в
-//! частотном словаре своего языка, подбираются варианты исправления:
+//! Вызывается по завершении слова (разделитель): если слово НЕ валидно по
+//! словарям своего языка (ни в частотном, ни в орфографическом слое —
+//! `LangModel::valid`), подбираются варианты исправления:
 //!
 //! * [`SuggestionKind::Typo`] — словарные слова на расстоянии
 //!   Дамерау-Левенштейна 1 от напечатанного (замена, вставка, удаление,
@@ -24,7 +25,7 @@
 //!
 //! Приватность: слова не логируются на уровне info (только debug/trace).
 
-use crate::predictor::LangPair;
+use crate::predictor::{LangPair, ORTHO_PSEUDO_FREQ};
 
 /// Минимальная частота кандидата-исправления: хвост словаря (частоты ~десятков)
 /// — в основном шум субтитров и сам является опечатками.
@@ -99,7 +100,7 @@ pub fn suggestions(
         Script::Cyrillic => (&langs.ru, &langs.en, RU_ALPHABET),
         Script::Other => return Vec::new(),
     };
-    if model.dict.freq(&lower) > 0 {
+    if model.valid(&lower) {
         return Vec::new(); // словарное слово — не ошибка
     }
 
@@ -107,8 +108,10 @@ pub fn suggestions(
 
     // Вариант «не в той раскладке»: другой вид — словарное слово.
     if let Some(other) = other_view.map(str::to_lowercase) {
-        let freq = other_model.dict.freq(&other);
-        if freq > 0 {
+        if other_model.valid(&other) {
+            // Слова без частоты (только орфографический слой) ранжируем
+            // условной частотой нижней границы частотного среза.
+            let freq = other_model.dict.freq(&other).max(ORTHO_PSEUDO_FREQ);
             let score = candidate_score(freq, LAYOUT_BONUS);
             scored.push((
                 score,
@@ -537,7 +540,7 @@ mod tests {
             let Some(typo) = make_typo(word, &mut rnd) else {
                 continue;
             };
-            if typo == word || model.dict.freq(&typo) > 0 {
+            if typo == word || model.valid(&typo) {
                 continue; // опечатка не распознаётся как ошибка — попапа нет
             }
             samples += 1;

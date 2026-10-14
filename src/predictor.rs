@@ -30,19 +30,40 @@ use crate::dict::FrequencyDict;
 use crate::engine::Layout;
 use crate::keymap::KeyChars;
 use crate::ngram::NGramModel;
+use crate::ortho::OrthoSet;
 use crate::short_words::{self, is_short_ru};
 
 /// Словарь + n-граммная модель одного языка.
 pub struct LangModel {
+    /// Частотный слой: ранжирование («какое слово вероятнее»).
     pub dict: FrequencyDict,
+    /// Орфографический слой: валидность («это вообще слово?»).
+    pub ortho: OrthoSet,
+    /// n-граммная модель — резервный скоринг для слов вне словарей.
     pub ngram: NGramModel,
 }
 
 impl LangModel {
-    pub fn from_tsv(text: &str) -> Self {
+    /// Полная сборка: частотный слой из TSV + встроенный орфографический.
+    pub fn with_ortho(text: &str, ortho: OrthoSet) -> Self {
         let dict = FrequencyDict::load(text);
         let ngram = NGramModel::build(dict_words(&dict));
-        Self { dict, ngram }
+        Self { dict, ortho, ngram }
+    }
+
+    /// Сборка без орфографического слоя — для тестов из TSV-строк.
+    #[cfg(test)]
+    pub fn from_tsv(text: &str) -> Self {
+        Self::with_ortho(text, OrthoSet::empty())
+    }
+
+    /// Слово валидно: есть в частотном или орфографическом слое.
+    ///
+    /// Частотный слой покрывает живой узус (субтитры, имена, сленг),
+    /// орфографический — нормативные формы (спеллчек); вместе — минимум
+    /// ложных «опечаток».
+    pub fn valid(&self, word: &str) -> bool {
+        self.dict.freq(word) > 0 || self.ortho.contains(word)
     }
 }
 
@@ -68,25 +89,32 @@ impl LangPair {
         }
     }
 
-    /// Загружает встроенные словари (`assets/lang/*.tsv`, `include_bytes!`).
-    /// Разбор ~2×200k строк + построение n-грамм; результат кэшируется.
+    /// Загружает встроенные словари (`assets/lang/*`, `include_bytes!`):
+    /// частотные TSV + орфографические наборы. Разбор ~2×200k строк +
+    /// построение n-грамм; орфо-слои не разбираются. Результат кэшируется.
     pub fn load_embedded() -> Arc<Self> {
         static CACHE: OnceLock<Arc<LangPair>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
                 let started = Instant::now();
-                let en = LangModel::from_tsv(
+                let en = LangModel::with_ortho(
                     std::str::from_utf8(include_bytes!("../assets/lang/en.tsv"))
                         .expect("en.tsv — валидный UTF-8"),
+                    OrthoSet::new(include_bytes!("../assets/lang/en_ortho.bin"))
+                        .expect("en_ortho.bin — валидный блоб"),
                 );
-                let ru = LangModel::from_tsv(
+                let ru = LangModel::with_ortho(
                     std::str::from_utf8(include_bytes!("../assets/lang/ru.tsv"))
                         .expect("ru.tsv — валидный UTF-8"),
+                    OrthoSet::new(include_bytes!("../assets/lang/ru_ortho.bin"))
+                        .expect("ru_ortho.bin — валидный блоб"),
                 );
                 log::info!(
-                    "Словари загружены: en={} слов, ru={} слов, {:?}",
+                    "Словари загружены: en={} слов, ru={} слов, орфо en={}, ru={}, {:?}",
                     en.dict.len(),
                     ru.dict.len(),
+                    en.ortho.len(),
+                    ru.ortho.len(),
                     started.elapsed()
                 );
                 Arc::new(Self { en, ru })
@@ -132,6 +160,10 @@ impl Default for PredictorConfig {
 
 /// Бонус (в натах) за полное совпадение слова со словарём.
 const EXACT_BONUS: f64 = 1.0;
+/// Условная частота слова, валидного только по орфографии (нет в частотном
+/// срезе top-200k, значит в субтитрах она заведомо ниже порога отсечки ~14).
+/// Используется и спеллчеком для ранжирования таких слов.
+pub(crate) const ORTHO_PSEUDO_FREQ: u64 = 14;
 /// Пауза, после которой слово считается оборванным.
 pub const WORD_PAUSE: Duration = Duration::from_secs(3);
 /// Максимум символов в слове — дальше не решаем (защита от «залипания»).
@@ -400,10 +432,15 @@ impl Predictor {
         let max_prefix = model.dict.max_freq_prefix(lowercase_word);
         if max_prefix > 0 {
             let mut s = (max_prefix as f64).ln();
-            if model.dict.freq(lowercase_word) > 0 {
+            if model.valid(lowercase_word) {
                 s += EXACT_BONUS;
             }
             s
+        } else if model.valid(lowercase_word) {
+            // Слово есть в орфографии, но не в частотном срезе: его частота
+            // в субтитрах заведомо ниже порога отсечки словаря — берём её
+            // верхней границей вместо n-граммного резерва.
+            (ORTHO_PSEUDO_FREQ as f64).ln() + EXACT_BONUS
         } else {
             self.cfg.ngram_weight * model.ngram.score(lowercase_word)
         }
@@ -674,6 +711,27 @@ mod tests {
             Duration::from_millis(50),
         );
         assert!(switch_only(&ds).is_empty());
+    }
+
+    /// Орфографический слой: валидность объединяет оба слоя, слово без
+    /// частоты скорится условной частотой нижней границы среза, а не n-граммой.
+    #[test]
+    fn ortho_layer_validity_and_pseudo_freq_score() {
+        let ortho = OrthoSet::new(include_bytes!("../assets/lang/ru_ortho.bin"))
+            .expect("ru_ortho.bin — валидный блоб");
+        // В TSV только «слово», «переосвидетельствования» — только в орфографии.
+        let model = LangModel::with_ortho("слово\t100\n", ortho);
+        assert!(model.valid("слово")); // частотный слой
+        assert!(model.valid("переосвидетельствования")); // орфографический
+        assert!(!model.valid("ыпыпы"));
+
+        let langs = Arc::new(LangPair {
+            en: LangModel::from_tsv(EN_TSV),
+            ru: model,
+        });
+        let p = Predictor::new(langs, PredictorConfig::default());
+        let s = p.score(Layout::Ru, "переосвидетельствования");
+        assert_eq!(s, (ORTHO_PSEUDO_FREQ as f64).ln() + EXACT_BONUS);
     }
 
     #[test]

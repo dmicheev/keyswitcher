@@ -13,6 +13,7 @@ mod engine;
 mod keymap;
 mod layout_convert;
 mod ngram;
+mod ortho;
 mod predictor;
 mod short_words;
 mod spell;

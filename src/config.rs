@@ -126,21 +126,6 @@ impl Hotkey {
         }
     }
 
-    /// Тап Ctrl (без клавиши): значение `suggest_hotkey = ctrl` для систем
-    /// без ремапа модификаторов (парсится и без конструктора — остался для тестов).
-    #[cfg(test)]
-    pub fn ctrl_tap() -> Self {
-        Self {
-            mods: HotkeyMods {
-                ctrl: true,
-                shift: false,
-                option: false,
-                cmd: false,
-            },
-            key: None,
-        }
-    }
-
     /// Разбирает строку вида `option`, `ctrl+shift+f13`, `cmd+t`.
     /// Поддерживаются f1–f19, буквы a–z и комбинации модификаторов без
     /// клавиши (`option`, `ctrl+shift`, ...). Пустая строка — ошибка.

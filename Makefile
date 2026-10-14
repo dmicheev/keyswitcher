@@ -35,7 +35,7 @@ help:
 	@echo "  make lldb         - запуск debug-версии под отладчиком lldb"
 	@echo "  make debug        - сборка debug + запуск (отладочный прогон)"
 	@echo "  make test         - unit-тесты (cargo test)"
-	@echo "  make dicts        - (пере)генерация словарей assets/lang/*.tsv (нужна сеть)"
+	@echo "  make dicts        - (пере)генерация словарей assets/lang/*.tsv и *_ortho.bin (нужна сеть + unmunch)"
 	@echo "  make fmt          - форматирование (cargo fmt)"
 	@echo "  make clippy       - линтер (cargo clippy)"
 	@echo "  make check        - fmt --check + clippy + тесты"
@@ -64,8 +64,10 @@ debug: build
 test:
 	cargo test
 
-# Частотные словари для режима печати: скачивание FrequencyWords и
-# генерация assets/lang/{en,ru}.tsv (встраиваются в бинарник).
+# Словари для режима печати: частотные (FrequencyWords/OpenSubtitles) и
+# орфографические (Hunspell LibreOffice, раскрытие unmunch) —
+# assets/lang/{en,ru}.tsv и assets/lang/{en,ru}_ortho.bin (встраиваются в бинарник).
+# Зависимости: python3, сеть, `unmunch` (macOS: brew install hunspell).
 dicts:
 	python3 tools/dict/prepare.py
 

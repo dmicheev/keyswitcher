@@ -11,13 +11,25 @@
   * дедуп с суммированием частот;
   * сортировка по частоте, отрезаем top-200000.
 
-Зависимости: только stdlib (urllib). Запуск: `make dicts` или `python3 tools/dict/prepare.py`.
-Скачанные сырые файлы кэшируются в `tools/dict/cache/`.
+Второй слой — орфографические словари `assets/lang/<lang>_ortho.bin`: полные
+списки форм из Hunspell-словарей (LibreOffice, https://github.com/LibreOffice/dictionaries),
+раскрытые утилитой `unmunch`. Слой отвечает на вопрос «это вообще слово?»
+(спеллчек, предиктор), частоты из субтитров — «какое слово вероятнее»
+(ранжирование). Слова пишутся отсортированными, с префиксным сжатием
+(front-coding), формат см. в `src/ortho.rs`.
+
+Зависимости: stdlib + `unmunch` (macOS: `brew install hunspell`,
+Debian/Ubuntu: `apt install hunspell-tools`). Запуск: `make dicts` или
+`python3 tools/dict/prepare.py`. Скачанные сырые файлы кэшируются в
+`tools/dict/cache/`.
 """
 
 from __future__ import annotations
 
 import re
+import shutil
+import struct
+import subprocess
 import sys
 import urllib.request
 from collections import defaultdict
@@ -33,6 +45,14 @@ URL_CANDIDATES = [
     "{base}/2018/{lang}/{lang}_50k.txt",
     "{base}/2016/{lang}/{lang}_50k.txt",
 ]
+# Hunspell-словари (каталог в репозитории LibreOffice + базовое имя файлов).
+ORTHO_SOURCES = {
+    "en": "en/en_US",
+    "ru": "ru_RU/ru_RU",
+}
+ORTHO_BASE = "https://raw.githubusercontent.com/LibreOffice/dictionaries/master"
+# Шаг разреженного индекса бинарного орфо-словаря (слов на точку индекса).
+ORTHO_STRIDE = 32
 TOKEN_RE = {
     "en": re.compile(r"^[a-z']+$"),
     "ru": re.compile(r"^[а-яё-]+$"),
@@ -92,11 +112,111 @@ def prepare(lang: str) -> int:
     return len(top)
 
 
+def download_hunspell(lang: str) -> tuple[Path, Path]:
+    """Качает пару `.aff`/`.dic` Hunspell-словаря для языка, использует кэш."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    source = ORTHO_SOURCES[lang]
+    stem = source.rsplit("/", 1)[-1]
+    paths = []
+    for ext in (".aff", ".dic"):
+        url = f"{ORTHO_BASE}/{source}{ext}"
+        cache_path = CACHE / f"{lang}_{stem}{ext}"
+        if not (cache_path.exists() and cache_path.stat().st_size > 0):
+            print(f"  скачиваю {url} ...")
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                data = resp.read()
+            cache_path.write_bytes(data)
+        else:
+            print(f"  cache: {cache_path}")
+        paths.append(cache_path)
+    return paths[0], paths[1]
+
+
+def expand_hunspell(lang: str, aff: Path, dic: Path) -> list[str]:
+    """Раскрывает леммы с аффиксами в полный список форм утилитой `unmunch`."""
+    unmunch = shutil.which("unmunch")
+    if unmunch is None:
+        raise SystemExit(
+            "не найден `unmunch` (раскрытие аффиксов Hunspell): "
+            "macOS: brew install hunspell; Debian/Ubuntu: apt install hunspell-tools"
+        )
+    proc = subprocess.run(
+        [unmunch, str(dic), str(aff)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    forms = set()
+    for word in proc.stdout.splitlines():
+        word = word.strip().lower()
+        if TOKEN_RE[lang].match(word):
+            forms.add(word)
+    return sorted(forms)
+
+
+def write_ortho_binary(words: list[str], out: Path) -> None:
+    """Пишет отсортированный список слов во встроенный бинарный формат.
+
+    Формат (little-endian, см. также src/ortho.rs):
+      u32 magic "ORTO" | u32 version | u32 count | u32 stride
+      u32 offsets[ceil(count/stride)] — позиции первых записей блоков
+      записи в порядке сортировки: u8 prefix_len | u8 suffix_len | suffix
+
+    Каждая запись хранит только байты, отличающие её от предыдущего слова;
+    первая запись каждого блока — всегда целиком (prefix_len = 0), чтобы
+    бинарный поиск по блокам читал первое слово без докатывания префикса.
+    Поиск — бинарный по индексу + линейный проход по блоку из `stride` записей.
+    """
+    nblocks = (len(words) + ORTHO_STRIDE - 1) // ORTHO_STRIDE
+    header_size = 16 + 4 * nblocks
+
+    body = bytearray()
+    offsets = []
+    prev = b""
+    for i, word in enumerate(words):
+        block_start = i % ORTHO_STRIDE == 0
+        if block_start:
+            offsets.append(header_size + len(body))
+            prev = b""
+        raw = word.encode("utf-8")
+        shared = 0
+        for a, b in zip(raw, prev):
+            if a != b:
+                break
+            shared += 1
+        suffix = raw[shared:]
+        if shared > 0xFF or len(suffix) > 0xFF:
+            raise SystemExit(f"слишком длинное слово для формата: {word!r}")
+        body += bytes((shared, len(suffix))) + suffix
+        prev = raw
+
+    with out.open("wb") as fh:
+        fh.write(struct.pack("<4sIII", b"ORTO", 1, len(words), ORTHO_STRIDE))
+        for off in offsets:
+            fh.write(struct.pack("<I", off))
+        fh.write(body)
+
+
+def prepare_ortho(lang: str) -> int:
+    print(f"[{lang} орфо]")
+    aff, dic = download_hunspell(lang)
+    words = expand_hunspell(lang, aff, dic)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = OUT_DIR / f"{lang}_ortho.bin"
+    write_ortho_binary(words, out)
+    print(f"  форм: {len(words)}, записан {out.relative_to(ROOT)} ({out.stat().st_size} байт)")
+    return len(words)
+
+
 def main() -> None:
     for lang in LANGS:
         n = prepare(lang)
         if n == 0:
             raise SystemExit(f"пустой словарь для {lang}")
+        m = prepare_ortho(lang)
+        if m == 0:
+            raise SystemExit(f"пустой орфо-словарь для {lang}")
     print("готово")
 
 
