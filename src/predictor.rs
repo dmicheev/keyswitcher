@@ -284,6 +284,23 @@ impl Predictor {
         self.typed_layout = None;
     }
 
+    /// Сохраняет слово для повторной конвертации хоткеем: повторные тапы
+    /// переключают слово туда-обратно (Punto-стиль: y → н → y).
+    /// Незавершённое слово из буфера становится «последним» (разделителя
+    /// после него не было); уже зафиксированное остаётся как было, вместе
+    /// со своим разделителем. Спеллчек-попап для переписанного хоткеем
+    /// слова не нужен.
+    pub fn keep_last_word(&mut self) {
+        self.pending = None;
+        self.switched = false;
+        self.typed_layout = None;
+        if !self.buffer.is_empty() {
+            let word = std::mem::take(&mut self.buffer);
+            self.last_after = None;
+            self.last_word = Some(word);
+        }
+    }
+
     /// Обрабатывает нажатие клавиши. Возвращает решение, если пора
     /// переключаться. Разделители/цифры/символы завершают слово.
     pub fn feed_key(
@@ -1159,6 +1176,72 @@ mod tests {
     fn nothing_to_convert() {
         let p = pred(PredictorConfig::default());
         assert_eq!(p.convert_last_word(Layout::En), None);
+    }
+
+    /// Повторные тапы хоткея переключают слово туда-обратно (Punto-стиль):
+    /// y → н → y → н… Незавершённое слово (без разделителя).
+    #[test]
+    fn hotkey_conversion_toggles_pending_word() {
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        type_word(&mut p, "y", Layout::En, &mut now, Duration::from_millis(50));
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 1,
+                text: "н".into()
+            })
+        );
+        p.keep_last_word();
+        // Системная раскладка теперь RU — второй тап возвращает y.
+        assert_eq!(
+            p.convert_last_word(Layout::Ru),
+            Some(Conversion {
+                backspaces: 1,
+                text: "y".into()
+            })
+        );
+        p.keep_last_word();
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 1,
+                text: "н".into()
+            })
+        );
+    }
+
+    /// То же для зафиксированного слова с разделителем: разделитель
+    /// стирается и возвращается при каждом тапе.
+    #[test]
+    fn hotkey_conversion_toggles_committed_word() {
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        type_word(&mut p, "y", Layout::En, &mut now, Duration::from_millis(50));
+        now += Duration::from_millis(50);
+        p.feed_key(
+            crate::keymap::codes::SPACE,
+            false,
+            Layout::En,
+            false,
+            &StaticKeymap,
+            now,
+        );
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 2,
+                text: "н ".into()
+            })
+        );
+        p.keep_last_word();
+        assert_eq!(
+            p.convert_last_word(Layout::Ru),
+            Some(Conversion {
+                backspaces: 2,
+                text: "y ".into()
+            })
+        );
     }
 
     #[test]

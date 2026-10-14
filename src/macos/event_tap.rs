@@ -734,7 +734,7 @@ impl TypingPipeline {
             self.clip = None;
             return false;
         }
-        log::debug!("выделение: копирую через буфер обмена (Cmd+C)");
+        log::info!("выделение: копирую через буфер обмена (Cmd+C)");
         true
     }
 
@@ -758,7 +758,7 @@ impl TypingPipeline {
                     if clip.purpose == ClipPurpose::Convert {
                         // Буфер не изменился — выделения нет: обычная
                         // конвертация последнего слова (поведение Option-тапа).
-                        log::debug!("выделение: буфер не изменился — нет выделения");
+                        log::info!("выделение: буфер не изменился — нет выделения");
                         self.convert_last_word();
                     } else {
                         // Варианты замены без выделения — делать нечего.
@@ -982,7 +982,9 @@ impl TypingPipeline {
         }
         // Наше переключение не должно выглядеть ручной сменой.
         self.last_layout = Some(target);
-        self.predictor.forget_last();
+        // Слово остаётся «последним»: повторный тап переключит его обратно
+        // (Punto-стиль: y → н → y), а не сделает пустой no-op.
+        self.predictor.keep_last_word();
         log::info!("хоткей: конвертация {current:?} -> {target:?}");
     }
 
@@ -1099,6 +1101,11 @@ impl TypingPipeline {
                     down,
                 );
                 if !ev.is_null() {
+                    // Флаги — строго нулевые: созданное событие наследует
+                    // текущее состояние модификаторов источника (наш же
+                    // Cmd+C в буферном конвейере, зажатый пользователем
+                    // хоткей), а Cmd+Backspace в приложениях — правка.
+                    ffi::CGEventSetFlags(ev, 0);
                     ffi::CGEventPost(ffi::KCG_SESSION_EVENT_TAP, ev);
                     ffi::CFRelease(ev as ffi::CFTypeRef);
                 }
@@ -1142,9 +1149,10 @@ impl TypingPipeline {
             if ev.is_null() {
                 continue;
             }
-            if shift {
-                ffi::CGEventSetFlags(ev, flags);
-            }
+            // Флаги выставляются всегда: событие без SetFlags унаследовало
+            // бы текущие модификаторы источника (Cmd/Cmd+C конвейера, зажатые
+            // хоткеи) — буква превратилась бы в Cmd+клавишу (Cmd+W и т.п.).
+            ffi::CGEventSetFlags(ev, flags);
             ffi::CGEventKeyboardSetUnicodeString(ev, ch.len_utf16(), units.as_ptr());
             ffi::CGEventPost(ffi::KCG_SESSION_EVENT_TAP, ev);
             ffi::CFRelease(ev as ffi::CFTypeRef);
@@ -1166,6 +1174,9 @@ impl TypingPipeline {
                 if ev.is_null() {
                     continue;
                 }
+                // Как и в post_key_char: флаги только свои, без наследования
+                // состояния модификаторов источника.
+                ffi::CGEventSetFlags(ev, 0);
                 ffi::CGEventKeyboardSetUnicodeString(ev, chunk.len(), chunk.as_ptr());
                 ffi::CGEventPost(ffi::KCG_SESSION_EVENT_TAP, ev);
                 ffi::CFRelease(ev as ffi::CFTypeRef);
