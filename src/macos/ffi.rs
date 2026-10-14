@@ -196,7 +196,9 @@ pub const KCG_FLAG_COMMAND: CGEventFlags = 0x10_0000;
 pub const KCG_FLAG_NUMERIC_PAD: CGEventFlags = 0x20_0000;
 /// kCGEventFlagMaskAlphaShift (Caps Lock).
 pub const KCG_FLAG_ALPHA_SHIFT: CGEventFlags = 0x1_0000;
-/// Carbon shiftKey (бит 9) — модификаторы UCKeyTranslate.
+/// Carbon shiftKey (бит 9) — НЕ индекс состояния `UCKeyTranslate`
+/// (его младшие биты нулевые); для Shift используйте `UC_MOD_SHIFT = 0b10`.
+#[allow(dead_code)]
 pub const CARBON_SHIFT_KEY: u32 = 1 << 9;
 /// Carbon alphaLock (бит 10).
 #[allow(dead_code)]

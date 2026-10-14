@@ -8,11 +8,15 @@
 //! статической таблицы [`crate::keymap::StaticKeymap`].
 
 use crate::engine::Layout;
+use crate::keymap::codes;
 use crate::keymap::{KeyChars, StaticKeymap};
 use crate::macos::ffi;
 
 /// Максимум транслируемых кодов клавиш.
 const MAX_KEYCODE: u8 = 127;
+
+/// Индекс Shift-состояния модификаторов для `UCKeyTranslate` (см. `translate_layout`).
+const UC_MOD_SHIFT: u32 = 0b10;
 
 /// Таблицы одного языка: [код] → символ, без shift и со shift.
 type LangTables = Option<[Vec<Option<char>>; 2]>;
@@ -59,6 +63,34 @@ impl KeyChars for RuntimeKeymap {
         let en = en_static.map(|c| self.lookup(&self.en, keycode, shift, c));
         let ru = ru_static.map(|c| self.lookup(&self.ru, keycode, shift, c));
         Some((en, ru))
+    }
+}
+
+impl RuntimeKeymap {
+    /// Обратный поиск: клавиша (+shift), печатающая `ch` в раскладке
+    /// `layout`, — для посимвольного набора замены. Пробел — реальная
+    /// клавиша (в символьных таблицах его нет намеренно). Линейный скан
+    /// 128 кодов × 2 регистра — вызов на строку замены, не на поток печати.
+    pub fn keycode_for(&self, layout: Layout, ch: char) -> Option<(u8, bool)> {
+        if ch == ' ' {
+            return Some((codes::SPACE, false));
+        }
+        for shift in [false, true] {
+            for code in 0..=MAX_KEYCODE {
+                let Some((en, ru)) = self.chars_for(code, shift) else {
+                    continue;
+                };
+                let printed = match layout {
+                    Layout::En => en,
+                    Layout::Ru => ru,
+                    Layout::Other => None,
+                };
+                if printed == Some(ch) {
+                    return Some((code, shift));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -111,7 +143,11 @@ unsafe fn translate_layout(src: ffi::TISInputSourceRef) -> LangTables {
         ];
         let kbd_type = u32::from(ffi::LMGetKbdType());
         for shift in [false, true] {
-            let modifiers = if shift { ffi::CARBON_SHIFT_KEY } else { 0 };
+            // UCKeyTranslate ждёт индекс состояния модификаторов (младшие
+            // биты: 0 — без модификаторов, 0b10 — Shift), а не Carbon-бит
+            // `shiftKey` (1<<9): его младшие биты нулевые, и таблица Shift
+            // заполнялась строчными буквами.
+            let modifiers = if shift { UC_MOD_SHIFT } else { 0 };
             for code in 0..=MAX_KEYCODE {
                 if let Some(c) = translate_one(layout_ptr, code, modifiers, kbd_type) {
                     tables[usize::from(shift)][code as usize] = Some(c);
@@ -205,13 +241,47 @@ fn is_cyrillic(c: char) -> bool {
 mod tests {
     use super::*;
 
+    /// Таблицы, собранные один раз: TIS/Carbon не рассчитаны на
+    /// конкурентные вызовы из параллельных тестовых потоков.
+    fn shared() -> &'static RuntimeKeymap {
+        use std::sync::OnceLock;
+        static KM: OnceLock<RuntimeKeymap> = OnceLock::new();
+        KM.get_or_init(RuntimeKeymap::build)
+    }
+
     #[test]
     fn runtime_keymap_builds_or_falls_back() {
         // На машине с включёнными EN/RU источниками соберутся runtime-таблицы,
         // иначе всё останется на статике — в обоих случаях символы доступны.
-        let km = RuntimeKeymap::build();
-        let (en, ru) = km.chars_for(0x0C, false).expect("q/й доступны");
+        let (en, ru) = shared().chars_for(0x0C, false).expect("q/й доступны");
         assert_eq!(en, Some('q'));
         assert_eq!(ru, Some('й'));
+    }
+
+    #[test]
+    fn shifted_runtime_tables_have_uppercase() {
+        // Регрессия: shift-состояние передавалось Carbon-битом (младшие
+        // биты = 0), таблица Shift получала строчные буквы.
+        let (en, ru) = shared().chars_for(0x0C, true).expect("q/й доступны");
+        assert_eq!(en, Some('Q'));
+        assert_eq!(ru, Some('Й'));
+    }
+
+    #[test]
+    fn keycode_for_resolves_letters_and_shift() {
+        let km = shared();
+        assert_eq!(km.keycode_for(Layout::En, 'q'), Some((0x0C, false)));
+        assert_eq!(km.keycode_for(Layout::En, 'Q'), Some((0x0C, true)));
+        assert_eq!(km.keycode_for(Layout::Ru, 'й'), Some((0x0C, false)));
+        assert_eq!(km.keycode_for(Layout::Ru, 'Й'), Some((0x0C, true)));
+    }
+
+    #[test]
+    fn keycode_for_space_and_unmapped() {
+        let km = shared();
+        // Пробел — реальная клавиша, а не символьная таблица.
+        assert_eq!(km.keycode_for(Layout::Ru, ' '), Some((codes::SPACE, false)));
+        // Кириллицы в латинской раскладке нет — нужен unicode-фолбек.
+        assert_eq!(km.keycode_for(Layout::En, 'я'), None);
     }
 }

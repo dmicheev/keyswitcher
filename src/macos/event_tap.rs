@@ -4,7 +4,8 @@
 //! [`TypingPipeline`] ставит на main run loop активный CGEventTap
 //! (keyDown + flagsChanged), пропускает события через [`Predictor`] и при
 //! уверенном определении языка переключает раскладку с исправлением уже
-//! набранного префикса (backspace × k + unicode-событие). Отдельно
+//! набранного префикса (backspace × k + посимвольный набор, [`Self::post_text`]).
+//! Отдельно
 //! обрабатываются два хоткея: конвертация (`convert_hotkey`, по умолчанию
 //! тап Option) — при активном выделении конвертируется весь выделенный
 //! текст (через AX или буфер обмена), иначе — последнее слово; и варианты
@@ -543,16 +544,28 @@ impl TypingPipeline {
             return;
         };
         self.hide_suggest_panel();
-        if let Some(target) = fix.layout {
-            if !self.system.set_layout(target) {
-                log::warn!("подсказка: не удалось переключить раскладку на {target:?}");
+        // Раскладка переключается ДО набора: keycode-события переводятся
+        // приложением по текущей раскладке (см. `post_text`). Не удалось —
+        // весь ввод уходит unicode-событиями (не зависят от раскладки).
+        let layout = match fix.layout {
+            Some(target) => {
+                if self.system.set_layout(target) {
+                    // Наше переключение не должно выглядеть ручной сменой.
+                    self.last_layout = Some(target);
+                    Some(target)
+                } else {
+                    log::warn!("подсказка: не удалось переключить раскладку на {target:?}");
+                    None
+                }
             }
-            // Наше переключение не должно выглядеть ручной сменой.
-            self.last_layout = Some(target);
-        }
+            None => self.known_layout(),
+        };
         unsafe {
             self.post_backspaces(fix.backspaces);
-            self.post_unicode(&fix.text);
+            match layout {
+                Some(l) => self.post_text(&fix.text, l),
+                None => self.post_unicode(&fix.text),
+            }
         }
         self.predictor.forget_last();
         log::info!("Режим печати: подсказка применена");
@@ -831,9 +844,15 @@ impl TypingPipeline {
             log::debug!("выделение: конвертировать нечего");
             return false;
         };
-        unsafe { self.post_unicode(&converted) };
-        if !self.system.set_layout(target) {
-            log::warn!("выделение: не удалось переключить раскладку на {target:?}");
+        // Раскладка до набора: keycode-события переводятся приложением
+        // по текущей раскладке (см. `post_text`).
+        unsafe {
+            if self.system.set_layout(target) {
+                self.post_text(&converted, target);
+            } else {
+                log::warn!("выделение: не удалось переключить раскладку на {target:?}");
+                self.post_unicode(&converted);
+            }
         }
         // Наше переключение не должно выглядеть ручной сменой.
         self.last_layout = Some(target);
@@ -938,12 +957,16 @@ impl TypingPipeline {
             log::debug!("хоткей: конвертировать нечего");
             return;
         };
+        unsafe { self.post_backspaces(conv.backspaces) };
+        // Раскладка до набора: keycode-события переводятся приложением
+        // по текущей раскладке (см. `post_text`).
         unsafe {
-            self.post_backspaces(conv.backspaces);
-            self.post_unicode(&conv.text);
-        }
-        if !self.system.set_layout(target) {
-            log::warn!("хоткей: не удалось переключить раскладку на {target:?}");
+            if self.system.set_layout(target) {
+                self.post_text(&conv.text, target);
+            } else {
+                log::warn!("хоткей: не удалось переключить раскладку на {target:?}");
+                self.post_unicode(&conv.text);
+            }
         }
         // Наше переключение не должно выглядеть ручной сменой.
         self.last_layout = Some(target);
@@ -962,11 +985,19 @@ impl TypingPipeline {
         if self.retro_fix {
             unsafe {
                 self.post_backspaces(typed);
-                self.post_unicode(replacement);
+                self.post_text(replacement, to);
             }
             log::info!("Режим печати: {from:?} -> {to:?} (+ретро-фикс)");
         } else {
             log::info!("Режим печати: {from:?} -> {to:?}");
+        }
+    }
+
+    /// Текущая раскладка, если это EN/RU (`None` — прочие методы ввода).
+    fn known_layout(&mut self) -> Option<Layout> {
+        match self.current_layout() {
+            l @ (Layout::En | Layout::Ru) => Some(l),
+            Layout::Other => None,
         }
     }
 
@@ -1060,8 +1091,55 @@ impl TypingPipeline {
         }
     }
 
-    /// Ввод строки одним unicode-событием (ключевая пара keyDown/keyUp).
-    /// Длинные строки режутся на куски по ~20 UTF-16 единиц.
+    /// Ввод строки посимвольным набором на раскладке `layout`.
+    ///
+    /// Приложения вроде gpui/Zed игнорируют unicode-строку синтетического
+    /// события и вычисляют символ из кода клавиши по текущей раскладке —
+    /// одно unicode-событие на всю строку вставляет там один неверный
+    /// символ. Поэтому каждый символ ищется в таблице раскладки (код +
+    /// shift) и постится отдельной парой keyDown/keyUp — как настоящая
+    /// печать; в событие пишется и сам символ (для приложений, читающих
+    /// `characters`). Символы без клавиши в таблицах — unicode-событием.
+    /// Раскладка `layout` должна быть уже выбрана в системе.
+    ///
+    /// # Safety
+    /// Постинг событий; source создан в `install`.
+    unsafe fn post_text(&self, text: &str, layout: Layout) {
+        for ch in text.chars() {
+            match self.keymap.keycode_for(layout, ch) {
+                Some((code, shift)) => self.post_key_char(code, shift, ch),
+                None => self.post_unicode(&ch.to_string()),
+            }
+        }
+    }
+
+    /// Пара keyDown/keyUp одной клавиши (+Shift при необходимости); в
+    /// событие пишется и сам символ — для приложений, читающих unicode-строку.
+    ///
+    /// # Safety
+    /// Постинг событий; source создан в `install`.
+    unsafe fn post_key_char(&self, keycode: u8, shift: bool, ch: char) {
+        let flags = if shift { ffi::KCG_FLAG_SHIFT } else { 0 };
+        let mut units = [0u16; 2]; // char занимает не более 2 UTF-16 единиц
+        ch.encode_utf16(&mut units);
+        for &down in &[true, false] {
+            let ev = ffi::CGEventCreateKeyboardEvent(self.posting_source, u16::from(keycode), down);
+            if ev.is_null() {
+                continue;
+            }
+            if shift {
+                ffi::CGEventSetFlags(ev, flags);
+            }
+            ffi::CGEventKeyboardSetUnicodeString(ev, ch.len_utf16(), units.as_ptr());
+            ffi::CGEventPost(ffi::KCG_SESSION_EVENT_TAP, ev);
+            ffi::CFRelease(ev as ffi::CFTypeRef);
+        }
+    }
+
+    /// Unicode-событие (вся строка одним keyDown/keyUp) — фолбек для
+    /// символов, которым нет клавиши в раскладке, и для случаев, когда
+    /// целевую раскладку выбрать не удалось. Длинные строки режутся
+    /// на куски по ~20 UTF-16 единиц.
     ///
     /// # Safety
     /// Постинг событий; source создан в `install`.
