@@ -5,11 +5,13 @@
 //! (keyDown + flagsChanged), пропускает события через [`Predictor`] и при
 //! уверенном определении языка переключает раскладку с исправлением уже
 //! набранного префикса (backspace × k + unicode-событие). Отдельно
-//! обрабатывается горячая клавиша конвертации: при активном выделении
-//! конвертируется весь выделенный текст (через AX + ввод поверх выделения),
-//! иначе — последнее слово. Работает и при выключенном `typing_detect`. По завершении слова
-//! разделителем (пробел) неизвестное слово проверяется спеллчеком
-//! ([`crate::spell`]) и при наличии вариантов показывается попап
+//! обрабатываются два хоткея: конвертация (`convert_hotkey`, по умолчанию
+//! тап Option) — при активном выделении конвертируется весь выделенный
+//! текст (через AX или буфер обмена), иначе — последнее слово; и варианты
+//! замены (`suggest_hotkey`, по умолчанию тап Ctrl) — попап с вариантами
+//! для выделенного слова. Оба работают и при выключенном `typing_detect`.
+//! По завершении слова разделителем (пробел) неизвестное слово проверяется
+//! спеллчеком ([`crate::spell`]) и при наличии вариантов показывается попап
 //! [`SuggestPanel`]: цифры 1–9 применяют вариант, Esc закрывает.
 //!
 //! Свойства:
@@ -57,18 +59,30 @@ const CLIP_POLL_INTERVAL: f64 = 0.03;
 /// буфер асинхронно — ранняя замена вставила бы старый текст).
 const CLIP_RESTORE_DELAY: Duration = Duration::from_millis(350);
 
-/// Режим буферного конвейера конвертации выделения.
+/// Режим буферного конвейера конверации/подсказок для выделения.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClipPhase {
     /// Скопировали (Cmd+C), ждём изменения буфера.
     Copy,
-    /// Записали конверт, отправили Cmd+V, ждём вставки перед восстановлением.
+    /// Действие выполнено (вставка для Convert; попап для Suggest),
+    /// ждём перед восстановлением буфера.
     Paste,
 }
 
-/// Состояние асинхронной конвертации выделения через буфер обмена.
+/// Зачем запущен буферный конвейер.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipPurpose {
+    /// Конвертация выделения: скопировать → заменить → Cmd+V.
+    Convert,
+    /// Варианты замены: скопировать → показать попап (без вставки).
+    Suggest,
+}
+
+/// Состояние асинхронной работы с выделением через буфер обмена.
 struct ClipConvert {
     phase: ClipPhase,
+    /// Цель конвейера (конвертация или варианты замены).
+    purpose: ClipPurpose,
     /// Буфер до копирования: строка — восстановим после вставки,
     /// `None` — не-строковое содержимое (не умеем сохранять).
     old_string: Option<String>,
@@ -83,12 +97,20 @@ struct ClipConvert {
 /// «Рецепт» применения варианта исправления.
 #[derive(Debug, Clone)]
 struct SuggestFix {
-    /// Сколько backspace нажать (слово + разделитель).
+    /// Сколько backspace нажать: слово + разделитель (автопопап) либо 1 —
+    /// при активном выделении backspace удаляет выделение целиком.
     backspaces: usize,
-    /// Что ввести (исправление + разделитель).
+    /// Что ввести (исправление + разделитель либо просто вариант).
     text: String,
     /// Целевая раскладка для варианта-конвертации (`None` — не переключать).
     layout: Option<Layout>,
+}
+
+/// Какой хоткей запустил отложенную работу (конвертация или варианты).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapKind {
+    Convert,
+    Suggest,
 }
 
 /// Режим печати: тап + предиктор + постинг событий + попап подсказок.
@@ -102,6 +124,8 @@ pub struct TypingPipeline {
     typing_detect: bool,
     retro_fix: bool,
     hotkey: Hotkey,
+    /// Хоткей вариантов замены выделенного слова (по умолчанию тап Ctrl).
+    suggest_hotkey: Hotkey,
     /// Настройки спеллчека (проекция конфигурации).
     spell: SpellConfig,
     /// Попап подсказок (создаётся вместе с конвейером, скрыт).
@@ -131,8 +155,11 @@ pub struct TypingPipeline {
     last_layout: Option<Layout>,
     /// Имя нашего бинарника (детект собственного окна настроек).
     own_exe: Option<String>,
-    /// «Взведён» ли тап модификатора (модификаторы нажаты без других клавиш).
-    mod_tap_armed: bool,
+    /// Взведённый тап модификатора (модификаторы нажаты без других клавиш)
+    /// и какой это хоткей; `None` — не взведён.
+    mod_tap_armed: Option<TapKind>,
+    /// Какая работа запланирована one-shot таймером (после тапа хоткея).
+    pending_tap: TapKind,
     /// Таймер конвертации: one-shot (отложенный старт после хоткея) либо
     /// повторяющийся (опрос буфера обмена); `null` — не запланирован.
     convert_timer: ffi::CFRunLoopTimerRef,
@@ -171,6 +198,7 @@ impl TypingPipeline {
             typing_detect: config.typing_detect,
             retro_fix: config.retro_fix,
             hotkey: config.convert_hotkey,
+            suggest_hotkey: config.suggest_hotkey,
             spell: spell_cfg(config),
             suggest_panel: SuggestPanel::new(),
             pending_fixes: Vec::new(),
@@ -187,7 +215,8 @@ impl TypingPipeline {
             own_exe: std::env::current_exe()
                 .ok()
                 .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())),
-            mod_tap_armed: false,
+            mod_tap_armed: None,
+            pending_tap: TapKind::Convert,
             convert_timer: core::ptr::null_mut(),
             clip: None,
         });
@@ -282,6 +311,7 @@ impl TypingPipeline {
         self.typing_detect = config.typing_detect;
         self.retro_fix = config.retro_fix;
         self.hotkey = config.convert_hotkey;
+        self.suggest_hotkey = config.suggest_hotkey;
         self.spell = spell_cfg(config);
         // Хоткей работает независимо от typing_detect, поэтому слова
         // отслеживаются всегда; автопереключение (включая карту коротких
@@ -370,17 +400,20 @@ impl TypingPipeline {
             // Событие не поглощаем — обычная печать продолжается.
         }
 
-        // 4. Хоткей конвертации работает всегда (модификаторы сверяем точно).
+        // 4. Хоткеи работают всегда (модификаторы сверяем точно).
         if self.hotkey_matches(keycode) {
             log::debug!("хоткей: нажатие распознано (keycode={keycode:#x})");
             self.request_convert();
             return event;
         }
+        if self.suggest_hotkey_matches(keycode) {
+            log::debug!("хоткей вариантов: нажатие распознано (keycode={keycode:#x})");
+            self.request_suggest();
+            return event;
+        }
 
         // Любая аппаратная клавиша «погашает» взведённый тап модификатора.
-        if self.hotkey.is_mod_only() {
-            self.mod_tap_armed = false;
-        }
+        self.mod_tap_armed = None;
 
         // 5. В исключениях не вмешиваемся — и слова не запоминаем
         // (иначе хоткей мог бы конвертировать слово, набранное в
@@ -531,12 +564,27 @@ impl TypingPipeline {
     /// поэтому работа планируется one-shot таймером main run loop.
     fn request_convert(&mut self) {
         if !self.convert_timer.is_null() || self.clip.is_some() {
-            return; // конвертация уже идёт
+            return; // работа с выделением уже идёт
         }
+        self.pending_tap = TapKind::Convert;
         if self.arm_convert_timer(CONVERT_DELAY, 0.0) {
             return;
         }
         self.convert_selection_or_word();
+    }
+
+    /// Хоткей вариантов замены (тап Ctrl): попап с вариантами для
+    /// выделенного слова — конвертация раскладки и исправления опечаток.
+    fn request_suggest(&mut self) {
+        if !self.convert_timer.is_null() || self.clip.is_some() {
+            return; // работа с выделением уже идёт
+        }
+        // Повторный тап при открытом попапе просто обновит варианты.
+        self.pending_tap = TapKind::Suggest;
+        if self.arm_convert_timer(CONVERT_DELAY, 0.0) {
+            return;
+        }
+        self.suggest_for_selection();
     }
 
     /// Создаёт таймер конвертации (`interval == 0` — one-shot) и добавляет
@@ -591,9 +639,12 @@ impl TypingPipeline {
     fn on_convert_timer(&mut self) {
         if self.clip.is_some() {
             self.on_clip_poll();
-        } else {
-            // Первый (отложенный) выстрел: пробуем выделение.
-            self.convert_selection_or_word();
+            return;
+        }
+        // Первый (отложенный) выстрел: работа по тапнутому хоткею.
+        match self.pending_tap {
+            TapKind::Convert => self.convert_selection_or_word(),
+            TapKind::Suggest => self.suggest_for_selection(),
         }
     }
 
@@ -602,7 +653,7 @@ impl TypingPipeline {
         if self.convert_selection() {
             return;
         }
-        if self.start_clip_convert() {
+        if self.start_clip_convert(ClipPurpose::Convert) {
             return;
         }
         self.convert_last_word();
@@ -633,11 +684,11 @@ impl TypingPipeline {
         )
     }
 
-    /// Запускает конвертацию выделения через буфер обмена (для приложений,
+    /// Запускает работу с выделением через буфер обмена (для приложений,
     /// где AX выделение не отдаёт: Terminal, Electron и т.п.): Cmd+C → ждём
-    /// смену буфера → конвертация → Cmd+V → восстановление буфера.
-    /// `true` — конвейер запущен (завершится асинхронно).
-    fn start_clip_convert(&mut self) -> bool {
+    /// смену буфера → действие по цели ([`ClipPurpose`]) → восстановление
+    /// буфера. `true` — конвейер запущен (завершится асинхронно).
+    fn start_clip_convert(&mut self, purpose: ClipPurpose) -> bool {
         if self.clip.is_some() || self.excluded {
             return false;
         }
@@ -647,6 +698,7 @@ impl TypingPipeline {
         };
         self.clip = Some(ClipConvert {
             phase: ClipPhase::Copy,
+            purpose,
             old_string: pasteboard::string(),
             old_count: count,
             our_count: count,
@@ -664,7 +716,7 @@ impl TypingPipeline {
     /// Очередной опрос буферного конвейера: фаза Copy — ждём содержимое
     /// выделения; фаза Paste — ждём вставки и восстанавливаем буфер.
     fn on_clip_poll(&mut self) {
-        let Some(mut clip) = self.clip.take() else {
+        let Some(clip) = self.clip.take() else {
             self.stop_convert_timer();
             return;
         };
@@ -672,58 +724,23 @@ impl TypingPipeline {
             ClipPhase::Copy => {
                 let count = pasteboard::change_count().unwrap_or(clip.old_count);
                 if count != clip.old_count {
-                    let copied = pasteboard::string();
-                    match copied.as_deref().and_then(|s| self.converter.convert(s)) {
-                        Some((converted, target)) => {
-                            if !pasteboard::set_string(&converted) {
-                                log::warn!("выделение: не удалось записать буфер обмена");
-                                self.stop_convert_timer();
-                                return;
-                            }
-                            clip.our_count = pasteboard::change_count().unwrap_or(count);
-                            clip.phase = ClipPhase::Paste;
-                            clip.deadline = Instant::now() + CLIP_RESTORE_DELAY;
-                            // В терминалах Cmd+V вставляет в позицию каретки,
-                            // игнорируя выделение (в отличие от текстовых
-                            // редакторов), — сначала удаляем выделение Backspace.
-                            // Если приложение сняло выделение при копировании
-                            // (редкая экзотика), пострадает один символ перед
-                            // кареткой — поэтому список терминалов, а не все
-                            // приложения буферного пути.
-                            let is_terminal = self
-                                .current_app
-                                .as_ref()
-                                .is_some_and(|(id, name)| is_terminal_like(id, name));
-                            if is_terminal {
-                                unsafe { self.post_backspaces(1) };
-                            }
-                            unsafe { self.post_cmd_key(codes::KEY_V) };
-                            if !self.system.set_layout(target) {
-                                log::warn!(
-                                    "выделение: не удалось переключить раскладку на {target:?}"
-                                );
-                            }
-                            // Наше переключение не должно выглядеть ручной сменой.
-                            self.last_layout = Some(target);
-                            self.predictor.forget_last();
-                            log::info!(
-                                "хоткей: конвертация выделения через буфер ({}) -> {target:?}",
-                                converted.chars().count()
-                            );
-                            self.clip = Some(clip);
-                        }
-                        None => {
-                            // Выделение есть, но конвертировать нечего; backspace
-                            // последнего слова разрушил бы выделение — выходим.
-                            log::debug!("выделение: конвертировать нечего");
-                            self.stop_convert_timer();
-                        }
+                    match clip.purpose {
+                        ClipPurpose::Convert => self.on_clip_copied_convert(clip, count),
+                        ClipPurpose::Suggest => self.on_clip_copied_suggest(clip, count),
                     }
                 } else if Instant::now() >= clip.deadline {
-                    // Буфер не изменился — выделения нет: обычная конвертация слова.
-                    log::debug!("выделение: буфер не изменился — нет выделения");
                     self.stop_convert_timer();
-                    self.convert_last_word();
+                    if clip.purpose == ClipPurpose::Convert {
+                        // Буфер не изменился — выделения нет: обычная
+                        // конвертация последнего слова (поведение Option-тапа).
+                        log::debug!("выделение: буфер не изменился — нет выделения");
+                        self.convert_last_word();
+                    } else {
+                        // Варианты замены без выделения — делать нечего.
+                        // Важно: НЕ фолбэкаемся на конвертацию слова, иначе
+                        // тап Ctrl вел бы себя как тап Option.
+                        log::debug!("подсказка: буфер не изменился — нет выделения");
+                    }
                 } else {
                     self.clip = Some(clip);
                 }
@@ -731,7 +748,7 @@ impl TypingPipeline {
             ClipPhase::Paste => {
                 if Instant::now() >= clip.deadline {
                     // Восстанавливаем прежний буфер, если после нашей записи
-                    // туда больше ничего не писали.
+                    // (или копирования выделения) туда больше ничего не писали.
                     if let Some(old) = clip.old_string {
                         if pasteboard::change_count() == Some(clip.our_count) {
                             pasteboard::set_string(&old);
@@ -744,6 +761,67 @@ impl TypingPipeline {
                 }
             }
         }
+    }
+
+    /// Буфер изменился при цели Convert: конвертируем скопированное,
+    /// записываем обратно и вставляем.
+    fn on_clip_copied_convert(&mut self, mut clip: ClipConvert, count: isize) {
+        let copied = pasteboard::string();
+        let Some((converted, target)) = copied.as_deref().and_then(|s| self.converter.convert(s))
+        else {
+            // Выделение есть, но конвертировать нечего; backspace
+            // последнего слова разрушил бы выделение — выходим.
+            log::debug!("выделение: конвертировать нечего");
+            self.stop_convert_timer();
+            return;
+        };
+        if !pasteboard::set_string(&converted) {
+            log::warn!("выделение: не удалось записать буфер обмена");
+            self.stop_convert_timer();
+            return;
+        }
+        clip.our_count = pasteboard::change_count().unwrap_or(count);
+        clip.phase = ClipPhase::Paste;
+        clip.deadline = Instant::now() + CLIP_RESTORE_DELAY;
+        // В терминалах Cmd+V вставляет в позицию каретки, игнорируя
+        // выделение (в отличие от текстовых редакторов), — сначала удаляем
+        // выделение Backspace. Если приложение сняло выделение при
+        // копировании (редкая экзотика), пострадает один символ перед
+        // кареткой — поэтому список терминалов, а не все приложения
+        // буферного пути.
+        let is_terminal = self
+            .current_app
+            .as_ref()
+            .is_some_and(|(id, name)| is_terminal_like(id, name));
+        if is_terminal {
+            unsafe { self.post_backspaces(1) };
+        }
+        unsafe { self.post_cmd_key(codes::KEY_V) };
+        if !self.system.set_layout(target) {
+            log::warn!("выделение: не удалось переключить раскладку на {target:?}");
+        }
+        // Наше переключение не должно выглядеть ручной сменой.
+        self.last_layout = Some(target);
+        self.predictor.forget_last();
+        log::info!(
+            "хоткей: конвертация выделения через буфер ({}) -> {target:?}",
+            converted.chars().count()
+        );
+        self.clip = Some(clip);
+    }
+
+    /// Буфер изменился при цели Suggest: показываем попап вариантов для
+    /// скопированного слова и переходим к восстановлению буфера (без вставки).
+    fn on_clip_copied_suggest(&mut self, mut clip: ClipConvert, count: isize) {
+        let copied = pasteboard::string();
+        if let Some(word) = copied.as_deref() {
+            self.show_word_suggestions(word);
+        }
+        // Буфер сейчас содержит копию выделения — восстанавливаем прежний.
+        clip.our_count = pasteboard::change_count().unwrap_or(count);
+        clip.phase = ClipPhase::Paste;
+        clip.deadline = Instant::now() + CLIP_RESTORE_DELAY;
+        self.clip = Some(clip);
     }
 
     /// Конвертирует `selected` и вводит поверх выделения; общая часть
@@ -761,6 +839,90 @@ impl TypingPipeline {
         self.last_layout = Some(target);
         self.predictor.forget_last();
         log::info!("{label} -> {target:?}");
+        true
+    }
+
+    /// Хоткей вариантов замены: попап с вариантами для выделенного слова.
+    fn suggest_for_selection(&mut self) {
+        if self.excluded {
+            return;
+        }
+        let Some(pid) = self.system.frontmost_pid() else {
+            return;
+        };
+        let Some(selected) = ax_selected_text(pid) else {
+            log::debug!("подсказка: выделение недоступно через AX — пробую буфер обмена");
+            self.start_clip_convert(ClipPurpose::Suggest);
+            return;
+        };
+        self.show_word_suggestions(&selected);
+    }
+    /// Показывает попап вариантов замены для слова: конвертация раскладки
+    /// (если другой вид — словарное слово) и исправления опечаток.
+    /// Рецепты заменяют активное выделение (backspace при выделении удаляет
+    /// его целиком). `false` — вариантов нет.
+    fn show_word_suggestions(&mut self, selected: &str) -> bool {
+        // Отдельное слово: пробельные и фразовые выделения не подсказываем,
+        // обрамляющую пунктуацию («мама,», «"сын"») отрезаем.
+        let word = selected.trim().trim_matches(|c: char| !c.is_alphabetic());
+        if word.chars().count() < 2 || word.chars().any(char::is_whitespace) {
+            log::debug!("подсказка: выделение не похоже на слово");
+            return false;
+        }
+        let current = self.current_layout();
+        let other = self.converter.convert(word).map(|(t, _)| t);
+        // Явный запрос пользователя: порог длины ниже автопопапа,
+        // спеллчек принудительно включён.
+        let cfg = SpellConfig {
+            enabled: true,
+            min_chars: 2,
+            ..self.spell.clone()
+        };
+        let mut sugg = spell::suggestions(self.predictor.langs(), word, other.as_deref(), &cfg);
+        // Явный запрос на ЛЮБОМ слове: если спеллчеку нечего предложить,
+        // показываем хотя бы вариант конвертации раскладки.
+        if sugg.is_empty() {
+            if let Some((converted, _)) = self.converter.convert(word) {
+                sugg.push(crate::spell::Suggestion {
+                    text: converted,
+                    freq: 0,
+                    kind: SuggestionKind::Layout,
+                });
+            }
+        }
+        if sugg.is_empty() {
+            log::debug!("подсказка: вариантов для слова нет");
+            return false;
+        }
+        let layout_target = match current {
+            Layout::En => Some(Layout::Ru),
+            Layout::Ru => Some(Layout::En),
+            Layout::Other => None,
+        };
+        self.pending_fixes = sugg
+            .iter()
+            .map(|s| SuggestFix {
+                backspaces: 1, // при активном выделении удаляет выделение целиком
+                text: s.text.clone(),
+                layout: (s.kind == SuggestionKind::Layout)
+                    .then_some(layout_target)
+                    .flatten(),
+            })
+            .collect();
+        let labels: Vec<String> = sugg
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}  {}", i + 1, s.text))
+            .collect();
+
+        self.suggest_panel.show(&labels);
+        self.panel_visible = true;
+        self.panel_shown_at = Some(Instant::now());
+        self.panel_app = self.current_app.clone();
+        log::info!(
+            "хоткей: варианты замены слова (вариантов: {})",
+            labels.len()
+        );
         true
     }
 
@@ -820,28 +982,60 @@ impl TypingPipeline {
         mods_match(self.hotkey.mods, self.flags)
     }
 
-    /// Обработка flagsChanged: трекинг модификаторов и хоткей «тап
-    /// модификатора» — срабатывает на чистом отпускании (без других клавиш).
+    fn suggest_hotkey_matches(&self, keycode: u8) -> bool {
+        if self.suggest_hotkey.key != Some(keycode) {
+            return false;
+        }
+        mods_match(self.suggest_hotkey.mods, self.flags)
+    }
+
+    /// Какой хоткей «тап модификатора» точно совпадает с флагами (`None` — ни один).
+    fn matching_mod_tap(&self, flags: ffi::CGEventFlags) -> Option<TapKind> {
+        if self.hotkey.is_mod_only() && mods_match(self.hotkey.mods, flags) {
+            return Some(TapKind::Convert);
+        }
+        if self.suggest_hotkey.is_mod_only() && mods_match(self.suggest_hotkey.mods, flags) {
+            return Some(TapKind::Suggest);
+        }
+        None
+    }
+
+    /// Обработка flagsChanged: трекинг модификаторов и хоткеи «тап
+    /// модификатора» — срабатывают на чистом отпускании (без других клавиш).
     fn on_flags_changed(&mut self, event: ffi::CGEventRef) -> ffi::CGEventRef {
         let prev = self.flags;
         let cur = unsafe { ffi::CGEventGetFlags(event) };
         self.flags = cur;
-        if self.hotkey.is_mod_only() {
-            let was_exact = mods_match(self.hotkey.mods, prev);
-            let now_exact = mods_match(self.hotkey.mods, cur);
-            if now_exact && !was_exact {
-                // Модификаторы нажаты ровно в целевой комбинации.
-                self.mod_tap_armed = true;
-            } else if was_exact && !now_exact {
-                // Ушли из целевой комбинации: чистое отпускание -> триггер;
-                // добавление лишнего модификатора — просто гасим.
-                let any_hotkey_mod = cur & hotkey_mod_mask(self.hotkey.mods) != 0;
-                if self.mod_tap_armed && !any_hotkey_mod {
-                    log::debug!("хоткей: тап модификатора");
-                    self.request_convert();
+        let was = self.matching_mod_tap(prev);
+        let now = self.matching_mod_tap(cur);
+        match (was, now) {
+            // Модификаторы нажаты ровно в целевой комбинации — взводим.
+            (None, Some(kind)) => self.mod_tap_armed = Some(kind),
+            // Смена комбинации на лету (например, Option+Ctrl) — гасим.
+            (Some(_), Some(_)) => self.mod_tap_armed = None,
+            // Ушли из целевой комбинации: чистое отпускание -> триггер;
+            // если целевые модификаторы ещё держатся — просто гасим.
+            (Some(kind), None) => {
+                let mask = match kind {
+                    TapKind::Convert => hotkey_mod_mask(self.hotkey.mods),
+                    TapKind::Suggest => hotkey_mod_mask(self.suggest_hotkey.mods),
+                };
+                if self.mod_tap_armed == Some(kind) && cur & mask == 0 {
+                    log::debug!(
+                        "хоткей: тап модификатора ({})",
+                        match kind {
+                            TapKind::Convert => "конвертация",
+                            TapKind::Suggest => "варианты замены",
+                        }
+                    );
+                    match kind {
+                        TapKind::Convert => self.request_convert(),
+                        TapKind::Suggest => self.request_suggest(),
+                    }
                 }
-                self.mod_tap_armed = false;
+                self.mod_tap_armed = None;
             }
+            (None, None) => {}
         }
         event
     }
@@ -940,8 +1134,9 @@ impl Drop for TypingPipeline {
 }
 
 /// Колбэк таймера конвертации (C ABI). One-shot (interval == 0) — отложенный
-/// старт: снимаем таймер, возвращаем владение и конвертируем. Повторяющийся —
-/// опрос буферного конвейера: таймер продолжает тикать, остановит его сам
+/// старт: снимаем таймер, возвращаем владение и выполняем запланированную
+/// работу (`pending_tap`: конвертация или варианты). Повторяющийся — опрос
+/// буферного конвейера: таймер продолжает тикать, остановит его сам
 /// `on_clip_poll` через поле `convert_timer`.
 extern "C" fn convert_timer_callback(timer: ffi::CFRunLoopTimerRef, info: *mut core::ffi::c_void) {
     if info.is_null() {
@@ -956,10 +1151,10 @@ extern "C" fn convert_timer_callback(timer: ffi::CFRunLoopTimerRef, info: *mut c
             ffi::CFRunLoopTimerInvalidate(timer);
             ffi::CFRelease(timer as ffi::CFTypeRef);
         }
-        pipeline.convert_selection_or_word();
-    } else {
-        pipeline.on_convert_timer();
     }
+    // Обе ветки идут через диспетчер: one-shot — работа по pending_tap
+    // (конвертация ИЛИ варианты), повторяющийся — опрос буфера.
+    pipeline.on_convert_timer();
 }
 
 /// Колбэк тапа (C ABI): быстрый, без блокировок; событие не меняем.

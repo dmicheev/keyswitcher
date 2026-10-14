@@ -34,6 +34,9 @@
 //! # Горячая клавиша конвертации последнего слова / выделенного текста: [mods+]key
 //! convert_hotkey = f13
 //!
+//! # Горячая клавиша вариантов замены выделенного слова: [mods+]key | тап модификатора
+//! suggest_hotkey = command
+//!
 //! # Спеллчек-подсказки: попап с вариантами исправления по завершении слова
 //! spell_suggest = true
 //!
@@ -110,6 +113,34 @@ impl Default for Hotkey {
 }
 
 impl Hotkey {
+    /// Тап Command (без клавиши) — дефолтный хоткей вариантов замены слова.
+    pub fn cmd_tap() -> Self {
+        Self {
+            mods: HotkeyMods {
+                ctrl: false,
+                shift: false,
+                option: false,
+                cmd: true,
+            },
+            key: None,
+        }
+    }
+
+    /// Тап Ctrl (без клавиши): значение `suggest_hotkey = ctrl` для систем
+    /// без ремапа модификаторов (парсится и без конструктора — остался для тестов).
+    #[cfg(test)]
+    pub fn ctrl_tap() -> Self {
+        Self {
+            mods: HotkeyMods {
+                ctrl: true,
+                shift: false,
+                option: false,
+                cmd: false,
+            },
+            key: None,
+        }
+    }
+
     /// Разбирает строку вида `option`, `ctrl+shift+f13`, `cmd+t`.
     /// Поддерживаются f1–f19, буквы a–z и комбинации модификаторов без
     /// клавиши (`option`, `ctrl+shift`, ...). Пустая строка — ошибка.
@@ -183,8 +214,11 @@ impl Hotkey {
     }
 }
 
-/// Клавиша по имени: f1–f19 или буква a–z.
+/// Клавиша по имени: f1–f19, буква a–z или space.
 fn parse_key(name: &str) -> Option<u8> {
+    if name == "space" {
+        return Some(keymap::codes::SPACE);
+    }
     // F-клавиши в порядке f1..f19.
     const F_KEYS: [u8; 19] = [
         0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F, 0x69, 0x6B, 0x71,
@@ -231,6 +265,9 @@ fn key_name(code: u8) -> String {
             return name.to_string();
         }
     }
+    if code == keymap::codes::SPACE {
+        return "space".to_string();
+    }
     keymap::letter_name(code).map_or_else(|| format!("0x{code:02x}"), |c| c.to_string())
 }
 
@@ -255,6 +292,9 @@ pub struct Config {
     pub retro_fix: bool,
     /// Горячая клавиша конвертации последнего слова / выделенного текста.
     pub convert_hotkey: Hotkey,
+    /// Горячая клавиша показа вариантов замены выделенного слова
+    /// (попап с выбором цифрами 1–9).
+    pub suggest_hotkey: Hotkey,
     /// Спеллчек-подсказки: попап с вариантами исправления по завершении слова.
     pub spell_suggest: bool,
     /// Минимальная длина слова для спеллчек-подсказок.
@@ -281,6 +321,7 @@ impl Default for Config {
             switch_threshold: 100.0,
             retro_fix: true,
             convert_hotkey: Hotkey::default(),
+            suggest_hotkey: Hotkey::cmd_tap(),
             spell_suggest: true,
             spell_min_chars: 4,
             spell_max_suggestions: 5,
@@ -375,6 +416,9 @@ impl Config {
              # Горячая клавиша конвертации последнего слова или выделенного текста\n\
              # (например ctrl+shift+f13)\n\
              convert_hotkey = {}\n\n\
+             # Горячая клавиша вариантов замены выделенного слова: тап модификатора\n\
+             # показывает попап с вариантами, выбор цифрами 1-9 или кликом\n\
+             suggest_hotkey = {}\n\n\
              # Спеллчек-подсказки: после разделителя показывать попап с вариантами\n\
              # исправления, если слово похоже на опечатку (клик или цифры 1-9)\n\
              spell_suggest = {}\n\n\
@@ -398,6 +442,7 @@ impl Config {
             self.switch_threshold,
             self.retro_fix,
             self.convert_hotkey.to_display_string(),
+            self.suggest_hotkey.to_display_string(),
             self.spell_suggest,
             self.spell_min_chars,
             self.spell_max_suggestions,
@@ -467,6 +512,10 @@ impl Config {
                 "convert_hotkey" => match Hotkey::parse(value) {
                     Some(h) => cfg.convert_hotkey = h,
                     None => log::warn!("Некорректный convert_hotkey '{}', оставлен прежний", value),
+                },
+                "suggest_hotkey" => match Hotkey::parse(value) {
+                    Some(h) => cfg.suggest_hotkey = h,
+                    None => log::warn!("Некорректный suggest_hotkey '{}', оставлен прежний", value),
                 },
                 "spell_suggest" => {
                     if let Some(b) = parse_bool(value) {
@@ -540,6 +589,10 @@ mod tests {
         assert_eq!(cfg.convert_hotkey, Hotkey::default());
         assert!(cfg.convert_hotkey.mods.option);
         assert!(cfg.convert_hotkey.is_mod_only());
+        // Хоткей вариантов замены — тап Command (без клавиши).
+        assert_eq!(cfg.suggest_hotkey, Hotkey::cmd_tap());
+        assert!(cfg.suggest_hotkey.mods.cmd);
+        assert!(cfg.suggest_hotkey.is_mod_only());
         // Спеллчек-подсказки включены по умолчанию.
         assert!(cfg.spell_suggest);
         assert_eq!(cfg.spell_min_chars, 4);
@@ -612,6 +665,22 @@ convert_hotkey = ctrl+shift+f13
         assert_eq!(cfg.convert_hotkey, hk);
         assert!(hk.mods.ctrl && hk.mods.shift && !hk.mods.option && !hk.mods.cmd);
         assert_eq!(hk.key, Some(crate::keymap::codes::F13));
+    }
+
+    #[test]
+    fn test_parse_suggest_hotkey() {
+        // Дефолт — тап Ctrl.
+        assert_eq!(Config::default().suggest_hotkey, Hotkey::cmd_tap());
+        let cfg = Config::parse("suggest_hotkey = ctrl\n");
+        assert!(cfg.suggest_hotkey.is_mod_only());
+        assert!(cfg.suggest_hotkey.mods.ctrl);
+        assert_eq!(cfg.suggest_hotkey.to_display_string(), "ctrl");
+        // Клавишная комбинация тоже допустима.
+        let cfg = Config::parse("suggest_hotkey = ctrl+space\n");
+        assert_eq!(cfg.suggest_hotkey.key, Some(crate::keymap::codes::SPACE));
+        // Некорректное значение — остаётся дефолт.
+        let cfg = Config::parse("suggest_hotkey = nonsense\n");
+        assert_eq!(cfg.suggest_hotkey, Hotkey::cmd_tap());
     }
 
     #[test]
@@ -731,6 +800,7 @@ idle_pause_seconds = -5
         assert_eq!(parsed.switch_threshold, d.switch_threshold);
         assert_eq!(parsed.retro_fix, d.retro_fix);
         assert_eq!(parsed.convert_hotkey, d.convert_hotkey);
+        assert_eq!(parsed.suggest_hotkey, d.suggest_hotkey);
         assert_eq!(parsed.spell_suggest, d.spell_suggest);
         assert_eq!(parsed.spell_min_chars, d.spell_min_chars);
         assert_eq!(parsed.spell_max_suggestions, d.spell_max_suggestions);
@@ -753,6 +823,7 @@ idle_pause_seconds = -5
             switch_threshold: 55.5,
             retro_fix: false,
             convert_hotkey: Hotkey::parse("ctrl+shift+f13").unwrap(),
+            suggest_hotkey: Hotkey::parse("ctrl+space").unwrap(),
             spell_suggest: false,
             spell_min_chars: 5,
             spell_max_suggestions: 7,
@@ -770,6 +841,7 @@ idle_pause_seconds = -5
         assert_eq!(reloaded.switch_threshold, original.switch_threshold);
         assert_eq!(reloaded.retro_fix, original.retro_fix);
         assert_eq!(reloaded.convert_hotkey, original.convert_hotkey);
+        assert_eq!(reloaded.suggest_hotkey, original.suggest_hotkey);
         assert_eq!(reloaded.spell_suggest, original.spell_suggest);
         assert_eq!(reloaded.spell_min_chars, original.spell_min_chars);
         assert_eq!(
