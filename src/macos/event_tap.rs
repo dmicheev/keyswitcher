@@ -34,6 +34,7 @@ use crate::layout_convert::LayoutConverter;
 use crate::macos::ffi;
 use crate::macos::keymap::RuntimeKeymap;
 use crate::macos::pasteboard;
+use crate::macos::sound;
 use crate::macos::suggest_panel::SuggestPanel;
 use crate::macos::system::{ax_selected_text, MacSystem};
 use crate::predictor::{CommittedWord, Decision, Predictor, PredictorConfig};
@@ -129,6 +130,10 @@ pub struct TypingPipeline {
     suggest_hotkey: Hotkey,
     /// Настройки спеллчека (проекция конфигурации).
     spell: SpellConfig,
+    /// Короткий звук при автопереключении раскладки.
+    sound_switch: bool,
+    /// Короткий звук при показе попапа подсказок.
+    sound_suggest: bool,
     /// Попап подсказок (создаётся вместе с конвейером, скрыт).
     suggest_panel: SuggestPanel,
     /// «Рецепты» исправлений для показанного попапа.
@@ -201,6 +206,8 @@ impl TypingPipeline {
             hotkey: config.convert_hotkey,
             suggest_hotkey: config.suggest_hotkey,
             spell: spell_cfg(config),
+            sound_switch: config.sound_switch,
+            sound_suggest: config.sound_suggest,
             suggest_panel: SuggestPanel::new(),
             pending_fixes: Vec::new(),
             panel_visible: false,
@@ -314,6 +321,8 @@ impl TypingPipeline {
         self.hotkey = config.convert_hotkey;
         self.suggest_hotkey = config.suggest_hotkey;
         self.spell = spell_cfg(config);
+        self.sound_switch = config.sound_switch;
+        self.sound_suggest = config.sound_suggest;
         // Хоткей работает независимо от typing_detect, поэтому слова
         // отслеживаются всегда; автопереключение (включая карту коротких
         // слов) выключено флагом enabled.
@@ -521,6 +530,9 @@ impl TypingPipeline {
         self.panel_visible = true;
         self.panel_shown_at = Some(Instant::now());
         self.panel_app = self.current_app.clone();
+        if self.sound_suggest {
+            sound::play_suggest();
+        }
         log::info!(
             "Режим печати: попап подсказок (вариантов: {})",
             labels.len()
@@ -990,6 +1002,9 @@ impl TypingPipeline {
             log::info!("Режим печати: {from:?} -> {to:?} (+ретро-фикс)");
         } else {
             log::info!("Режим печати: {from:?} -> {to:?}");
+        }
+        if self.sound_switch {
+            sound::play_switch();
         }
     }
 

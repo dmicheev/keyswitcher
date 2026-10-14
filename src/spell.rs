@@ -152,8 +152,9 @@ fn candidate_score(freq: u64, edit_bonus: f64) -> f64 {
 }
 
 /// Словарные слова на расстоянии Дамерау-Левенштейна 1 от `lower`
-/// (с частотой не ниже [`MIN_TYPO_FREQ`]), без дубликатов. Третий элемент —
-/// бонус «похожести на реальную опечатку» (см. константы-бонусы).
+/// (с частотой не ниже [`MIN_TYPO_FREQ`] либо валидные по орфографическому
+/// слою — тогда с условной частотой [`ORTHO_PSEUDO_FREQ`]), без дубликатов.
+/// Третий элемент — бонус «похожести на реальную опечатку» (см. константы-бонусы).
 fn typo_candidates(
     model: &crate::predictor::LangModel,
     lower: &str,
@@ -173,6 +174,11 @@ fn typo_candidates(
         let freq = model.dict.freq(buf);
         if freq >= MIN_TYPO_FREQ {
             out.push((buf.to_string(), freq, bonus));
+        } else if model.ortho.contains(buf) {
+            // Исправление есть в орфографии, но не дотянуло до частотного
+            // среза (у «орфография» в субтитрах частоты нет вовсе) —
+            // ранжируем условной частотой нижней границы среза.
+            out.push((buf.to_string(), ORTHO_PSEUDO_FREQ, bonus));
         }
     };
 
@@ -408,6 +414,18 @@ mod tests {
         // «привт» (удаление е) -> «привет»; «прилив» дальше (вставка и).
         let s = suggestions(&pair(), "привт", None, &cfg());
         assert_eq!(texts(&s), vec!["привет".to_string()]);
+    }
+
+    /// Исправление есть только в орфографическом слое («орфография» — редкое
+    /// для субтитров слово, в частотном срезе его нет) — вариант всё равно
+    /// предлагается. Реальный кейс: «орфаграфия» -> «орфография».
+    #[test]
+    fn ortho_only_correction_is_suggested() {
+        let langs = LangPair::load_embedded();
+        assert_eq!(langs.ru.dict.freq("орфография"), 0);
+        let s = suggestions(&langs, "орфаграфия", None, &cfg());
+        assert_eq!(texts(&s), vec!["орфография".to_string()]);
+        assert_eq!(s[0].kind, SuggestionKind::Typo);
     }
 
     #[test]

@@ -286,6 +286,10 @@ pub struct Config {
     pub spell_min_chars: usize,
     /// Сколько вариантов исправления показывать (1..9).
     pub spell_max_suggestions: usize,
+    /// Короткий звук при автопереключении раскладки по печати.
+    pub sound_switch: bool,
+    /// Короткий звук при показе попапа с вариантами исправления.
+    pub sound_suggest: bool,
     /// История буфера обмена: сохранять копирования и показывать в меню.
     pub clipboard_history: bool,
     /// Сколько последних копирований держать в истории.
@@ -310,6 +314,8 @@ impl Default for Config {
             spell_suggest: true,
             spell_min_chars: 4,
             spell_max_suggestions: 5,
+            sound_switch: true,
+            sound_suggest: true,
             clipboard_history: true,
             clipboard_history_size: 50,
             write_log: false,
@@ -411,6 +417,10 @@ impl Config {
              spell_min_chars = {}\n\n\
              # Сколько вариантов исправления показывать (1..9)\n\
               spell_max_suggestions = {}\n\n\
+              # Короткий звук при автопереключении раскладки по печати\n\
+              sound_switch = {}\n\n\
+              # Короткий звук при показе попапа с вариантами исправления\n\
+              sound_suggest = {}\n\n\
               # История буфера обмена: сохранять копирования и показывать в меню\n\
               clipboard_history = {}\n\n\
               # Сколько последних копирований держать в истории\n\
@@ -431,6 +441,8 @@ impl Config {
             self.spell_suggest,
             self.spell_min_chars,
             self.spell_max_suggestions,
+            self.sound_switch,
+            self.sound_suggest,
             self.clipboard_history,
             self.clipboard_history_size,
             self.write_log,
@@ -512,6 +524,16 @@ impl Config {
                 }
                 "spell_max_suggestions" => {
                     cfg.spell_max_suggestions = value.parse().unwrap_or(cfg.spell_max_suggestions)
+                }
+                "sound_switch" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.sound_switch = b;
+                    }
+                }
+                "sound_suggest" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.sound_suggest = b;
+                    }
                 }
                 "clipboard_history" => {
                     if let Some(b) = parse_bool(value) {
@@ -789,6 +811,8 @@ idle_pause_seconds = -5
         assert_eq!(parsed.spell_suggest, d.spell_suggest);
         assert_eq!(parsed.spell_min_chars, d.spell_min_chars);
         assert_eq!(parsed.spell_max_suggestions, d.spell_max_suggestions);
+        assert_eq!(parsed.sound_switch, d.sound_switch);
+        assert_eq!(parsed.sound_suggest, d.sound_suggest);
         assert_eq!(parsed.clipboard_history, d.clipboard_history);
         assert_eq!(parsed.clipboard_history_size, d.clipboard_history_size);
         assert_eq!(parsed.write_log, d.write_log);
@@ -812,6 +836,8 @@ idle_pause_seconds = -5
             spell_suggest: false,
             spell_min_chars: 5,
             spell_max_suggestions: 7,
+            sound_switch: false,
+            sound_suggest: false,
             clipboard_history: false,
             clipboard_history_size: 20,
             write_log: true,
@@ -833,6 +859,8 @@ idle_pause_seconds = -5
             reloaded.spell_max_suggestions,
             original.spell_max_suggestions
         );
+        assert_eq!(reloaded.sound_switch, original.sound_switch);
+        assert_eq!(reloaded.sound_suggest, original.sound_suggest);
         assert_eq!(reloaded.clipboard_history, original.clipboard_history);
         assert_eq!(
             reloaded.clipboard_history_size,

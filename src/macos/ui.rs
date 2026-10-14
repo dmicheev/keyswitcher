@@ -93,6 +93,10 @@ struct SettingsUi {
     clip_check: Id,
     /// Чекбокс «писать журнал» (write_log, применяется после перезапуска).
     log_check: Id,
+    /// Чекбокс «звук при автопереключении» (sound_switch).
+    sound_switch_check: Id,
+    /// Чекбокс «звук при показе вариантов исправления» (sound_suggest).
+    sound_suggest_check: Id,
 }
 
 /// Всё состояние агента; трогается только из main-потока (колбэки AppKit).
@@ -543,7 +547,7 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // Чекбокс «Автокоррекция».
         let check: Id = msg_send![class!(NSButton), alloc];
-        let check: Id = msg_send![check, initWithFrame: rect(20.0, 322.0, 380.0, 24.0)];
+        let check: Id = msg_send![check, initWithFrame: rect(20.0, 358.0, 380.0, 24.0)];
         let _: () = msg_send![check, setButtonType: 3isize]; // NSButtonTypeSwitch (чекбокс)
         let _: () = msg_send![check, setTitle: nsstring("Автокоррекция раскладки")];
         let _: () = msg_send![content, addSubview: check];
@@ -551,7 +555,7 @@ fn build_settings(controller: Id) -> SettingsUi {
         // Чекбокс «Автопереключение по печати» (typing_detect).
         let typing_check: Id = msg_send![class!(NSButton), alloc];
         let typing_check: Id =
-            msg_send![typing_check, initWithFrame: rect(20.0, 294.0, 380.0, 24.0)];
+            msg_send![typing_check, initWithFrame: rect(20.0, 334.0, 380.0, 24.0)];
         let _: () = msg_send![typing_check, setButtonType: 3isize]; // чекбокс
         let _: () = msg_send![
             typing_check,
@@ -561,7 +565,7 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // Чекбокс «Спеллчек-подсказки» (spell_suggest).
         let spell_check: Id = msg_send![class!(NSButton), alloc];
-        let spell_check: Id = msg_send![spell_check, initWithFrame: rect(20.0, 266.0, 380.0, 24.0)];
+        let spell_check: Id = msg_send![spell_check, initWithFrame: rect(20.0, 310.0, 380.0, 24.0)];
         let _: () = msg_send![spell_check, setButtonType: 3isize]; // чекбокс
         let _: () = msg_send![
             spell_check,
@@ -571,7 +575,7 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // Чекбокс «Ретро-фикс».
         let retro_check: Id = msg_send![class!(NSButton), alloc];
-        let retro_check: Id = msg_send![retro_check, initWithFrame: rect(20.0, 238.0, 380.0, 24.0)];
+        let retro_check: Id = msg_send![retro_check, initWithFrame: rect(20.0, 286.0, 380.0, 24.0)];
         let _: () = msg_send![retro_check, setButtonType: 3isize]; // чекбокс
         let _: () = msg_send![
             retro_check,
@@ -581,7 +585,7 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // Чекбокс «История буфера обмена» (clipboard_history).
         let clip_check: Id = msg_send![class!(NSButton), alloc];
-        let clip_check: Id = msg_send![clip_check, initWithFrame: rect(20.0, 210.0, 380.0, 24.0)];
+        let clip_check: Id = msg_send![clip_check, initWithFrame: rect(20.0, 262.0, 380.0, 24.0)];
         let _: () = msg_send![clip_check, setButtonType: 3isize]; // чекбокс
         let _: () = msg_send![
             clip_check,
@@ -591,13 +595,34 @@ fn build_settings(controller: Id) -> SettingsUi {
 
         // Чекбокс «Писать журнал» (write_log, применяется после перезапуска).
         let log_check: Id = msg_send![class!(NSButton), alloc];
-        let log_check: Id = msg_send![log_check, initWithFrame: rect(20.0, 182.0, 380.0, 24.0)];
+        let log_check: Id = msg_send![log_check, initWithFrame: rect(20.0, 238.0, 380.0, 24.0)];
         let _: () = msg_send![log_check, setButtonType: 3isize]; // чекбокс
         let _: () = msg_send![
             log_check,
             setTitle: nsstring("Писать журнал (применится после перезапуска)")
         ];
         let _: () = msg_send![content, addSubview: log_check];
+
+        // Чекбоксы звуков (sound_switch, sound_suggest).
+        let sound_switch_check: Id = msg_send![class!(NSButton), alloc];
+        let sound_switch_check: Id =
+            msg_send![sound_switch_check, initWithFrame: rect(20.0, 214.0, 380.0, 24.0)];
+        let _: () = msg_send![sound_switch_check, setButtonType: 3isize]; // чекбокс
+        let _: () = msg_send![
+            sound_switch_check,
+            setTitle: nsstring("Звук при автопереключении раскладки")
+        ];
+        let _: () = msg_send![content, addSubview: sound_switch_check];
+
+        let sound_suggest_check: Id = msg_send![class!(NSButton), alloc];
+        let sound_suggest_check: Id =
+            msg_send![sound_suggest_check, initWithFrame: rect(20.0, 190.0, 380.0, 24.0)];
+        let _: () = msg_send![sound_suggest_check, setButtonType: 3isize]; // чекбокс
+        let _: () = msg_send![
+            sound_suggest_check,
+            setTitle: nsstring("Звук при показе вариантов исправления")
+        ];
+        let _: () = msg_send![content, addSubview: sound_suggest_check];
 
         // «Раскладка по умолчанию».
         let l1 = make_label(rect(20.0, 148.0, 205.0, 20.0), "Раскладка по умолчанию:");
@@ -654,6 +679,8 @@ fn build_settings(controller: Id) -> SettingsUi {
             spell_check,
             clip_check,
             log_check,
+            sound_switch_check,
+            sound_suggest_check,
         }
     }
 }
@@ -687,6 +714,8 @@ fn fill_settings(s: &SettingsUi, cfg: &Config) {
         let _: () = msg_send![s.spell_check, setState: cfg.spell_suggest as isize];
         let _: () = msg_send![s.clip_check, setState: cfg.clipboard_history as isize];
         let _: () = msg_send![s.log_check, setState: cfg.write_log as isize];
+        let _: () = msg_send![s.sound_switch_check, setState: cfg.sound_switch as isize];
+        let _: () = msg_send![s.sound_suggest_check, setState: cfg.sound_suggest as isize];
         let idx = match cfg.default_layout {
             DefaultLayout::En => 0,
             DefaultLayout::Ru => 1,
@@ -718,6 +747,8 @@ fn read_settings(s: &SettingsUi, base: &Config) -> Config {
         let spell: isize = msg_send![s.spell_check, state];
         let clip_history: isize = msg_send![s.clip_check, state];
         let write_log: isize = msg_send![s.log_check, state];
+        let sound_switch: isize = msg_send![s.sound_switch_check, state];
+        let sound_suggest: isize = msg_send![s.sound_suggest_check, state];
 
         Config {
             auto_correct: on == 1,
@@ -738,6 +769,8 @@ fn read_settings(s: &SettingsUi, base: &Config) -> Config {
             spell_suggest: spell == 1,
             clipboard_history: clip_history == 1,
             write_log: write_log == 1,
+            sound_switch: sound_switch == 1,
+            sound_suggest: sound_suggest == 1,
             ..base.clone()
         }
     }

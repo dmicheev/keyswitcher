@@ -6,6 +6,7 @@ pub mod ffi;
 pub mod headless;
 pub mod keymap;
 pub mod pasteboard;
+pub mod sound;
 pub mod suggest_panel;
 pub mod system;
 pub mod ui;
