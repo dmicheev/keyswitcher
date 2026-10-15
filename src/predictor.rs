@@ -21,6 +21,12 @@
 //! апостроф) хоть в одной раскладке — так RU-слова с х/ж/б/ю/ъ/ё (клавиши
 //! `[ ; , . ]` и backtick в EN) исправляются и из EN-раскладки.
 //!
+//! Одиночные знаки (`#`, `@`, `$` в EN; `№`, `"`, `;` в RU — клавиши
+//! Shift+2/3/4) автопереключением не трогаются: намерение по одному
+//! нажатию неопределимо. Их чинит хоткей-конвертация: знак, стоящий
+//! прямо у курсора, заменяется на вид другой раскладки, повторные тапы
+//! переключают туда-обратно.
+//!
 //! Приватность: содержимое буфера не логируется на уровне info (только debug/trace).
 
 use std::sync::{Arc, OnceLock};
@@ -229,6 +235,11 @@ pub struct Predictor {
     /// `None` — слово оборвано паузой/функциональной клавишей (контекст у
     /// курсора неизвестен — конвертация без «лишнего» backspace).
     last_after: Option<char>,
+    /// Последняя знаковая клавиша (не буква в обеих раскладках), стоящая
+    /// прямо у курсора: `#`/`@`/`$` (EN) ↔ `№`/`"`/`;` (RU) конвертируются
+    /// хоткеем как «слово» из одного символа. Автопереключение по знакам
+    /// невозможно (`№` — легитимный русский символ), ручная конвертация — да.
+    last_symbol: Option<KeyPress>,
     /// Зафиксированное слово, ожидающее обработки спеллчеком.
     pending: Option<CommittedWord>,
     /// Сработало ли автопереключение в текущем слове (гистерезис).
@@ -247,6 +258,7 @@ impl Predictor {
             buffer: Vec::new(),
             last_word: None,
             last_after: None,
+            last_symbol: None,
             pending: None,
             switched: false,
             typed_layout: None,
@@ -279,6 +291,7 @@ impl Predictor {
         self.buffer.clear();
         self.last_word = None;
         self.last_after = None;
+        self.last_symbol = None;
         self.pending = None;
         self.switched = false;
         self.typed_layout = None;
@@ -289,7 +302,8 @@ impl Predictor {
     /// Незавершённое слово из буфера становится «последним» (разделителя
     /// после него не было); уже зафиксированное остаётся как было, вместе
     /// со своим разделителем. Спеллчек-попап для переписанного хоткеем
-    /// слова не нужен.
+    /// слова не нужен. Одиночный знак у курсора сохраняется: повторные
+    /// тапы конвертируют его туда-обратно (# → № → #).
     pub fn keep_last_word(&mut self) {
         self.pending = None;
         self.switched = false;
@@ -297,6 +311,7 @@ impl Predictor {
         if !self.buffer.is_empty() {
             let word = std::mem::take(&mut self.buffer);
             self.last_after = None;
+            self.last_symbol = None;
             self.last_word = Some(word);
         }
     }
@@ -315,6 +330,7 @@ impl Predictor {
         if layout_changed_by_user {
             // Пользователь сам выбрал раскладку — доверяем ему, слово обрываем.
             self.reset_word();
+            self.last_symbol = None;
             self.last_event = Some(now);
             return Decision::None;
         }
@@ -332,6 +348,7 @@ impl Predictor {
             // курсора, забываем его целиком. Стрелки и прочие клавиши,
             // двигающие курсор, — то же самое. Реальные разделители
             // (space/enter/tab) отмечаем для хоткея и спеллчек-подсказок.
+            self.last_symbol = None;
             if keycode == crate::keymap::codes::BACKSPACE {
                 self.forget_last();
                 return Decision::None;
@@ -350,12 +367,14 @@ impl Predictor {
             Layout::Ru => (ru, en),
             Layout::Other => {
                 self.commit();
+                self.last_symbol = None;
                 return Decision::None;
             }
         };
         let Some(current_char) = current_char else {
             // Клавиша не производит символа в текущей раскладке.
             self.commit();
+            self.last_symbol = None;
             return Decision::None;
         };
 
@@ -371,7 +390,13 @@ impl Predictor {
             // Запоминаем сам символ: хоткей-конвертация сотрёт и введёт
             // его обратно, не подменяя пробелом. Карту коротких слов тут
             // не применяем: «C++», «A/B» и т.п. остались бы без «+»/«/»
-            // в другой раскладке.
+            // в другой раскладке. Знак запоминаем целиком (обе раскладки):
+            // одиночный знак у курсора конвертируется хоткеем (# ↔ №).
+            self.last_symbol = Some(KeyPress {
+                code: keycode,
+                en,
+                ru,
+            });
             self.commit_after(Some(current_char));
             return Decision::None;
         }
@@ -380,6 +405,7 @@ impl Predictor {
             self.commit();
         }
         self.typed_layout.get_or_insert(current_layout);
+        self.last_symbol = None; // у курсора теперь слово, а не знак
         self.buffer.push(KeyPress {
             code: keycode,
             en,
@@ -534,10 +560,33 @@ impl Predictor {
     }
 
     /// Конвертация последнего слова в другую раскладку (хоткей).
-    /// Берёт текущее недонабранное слово, иначе последнее зафиксированное
-    /// (восстанавливая символ-разделитель после него). `None` — нечего
-    /// конвертировать.
-    pub fn convert_last_word(&self, current_layout: Layout) -> Option<Conversion> {
+    /// Берёт текущее недонабранное слово, иначе одиночный знак у курсора
+    /// (`#` ↔ `№`), иначе последнее зафиксированное слово (восстанавливая
+    /// символ-разделитель после него). `None` — нечего конвертировать.
+    pub fn convert_last_word(&mut self, current_layout: Layout) -> Option<Conversion> {
+        if self.buffer.is_empty() {
+            if let Some(kp) = self.last_symbol {
+                let (cur, other) = match current_layout {
+                    Layout::En => (kp.en, kp.ru),
+                    Layout::Ru => (kp.ru, kp.en),
+                    Layout::Other => (None, None),
+                };
+                if let (Some(cur), Some(other)) = (cur, other) {
+                    if cur != other {
+                        // Символ у курсора заменён: контекст слова после него
+                        // тоже обновляем (для последующей конвертации слова).
+                        if self.last_after == Some(cur) {
+                            self.last_after = Some(other);
+                        }
+                        return Some(Conversion {
+                            backspaces: 1,
+                            text: other.to_string(),
+                        });
+                    }
+                    // Знак одинаков в обеих раскладках («+», «(») — пробуем слово.
+                }
+            }
+        }
         let (word, after) = if !self.buffer.is_empty() {
             (self.buffer.as_slice(), None)
         } else {
@@ -1174,7 +1223,7 @@ mod tests {
 
     #[test]
     fn nothing_to_convert() {
-        let p = pred(PredictorConfig::default());
+        let mut p = pred(PredictorConfig::default());
         assert_eq!(p.convert_last_word(Layout::En), None);
     }
 
@@ -1322,6 +1371,108 @@ mod tests {
                 text: "при1".into()
             })
         );
+    }
+
+    /// «№» (Shift+3 в RU) конвертируется хоткеем в «#» и обратно.
+    #[test]
+    fn symbol_conversion_toggles() {
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        // Shift+3 в RU-раскладке -> «№».
+        p.feed_key(0x14, true, Layout::Ru, false, &StaticKeymap, now);
+        assert_eq!(
+            p.convert_last_word(Layout::Ru),
+            Some(Conversion {
+                backspaces: 1,
+                text: "#".into()
+            })
+        );
+        // Повторный тап (раскладка уже EN) возвращает «№».
+        p.keep_last_word();
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 1,
+                text: "№".into()
+            })
+        );
+    }
+
+    /// Знаки, одинаковые в обеих раскладках, конвертацией не считаются —
+    /// хоткей работает как раньше (последнее слово).
+    #[test]
+    fn same_char_symbol_falls_back_to_word() {
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        type_word(&mut p, "c", Layout::En, &mut now, Duration::from_millis(50));
+        now += Duration::from_millis(50);
+        p.feed_key(0x18, true, Layout::En, false, &StaticKeymap, now); // '+'
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 2,
+                text: "с+".into()
+            })
+        );
+    }
+
+    /// Слово, набранное после знака, вытесняет его из хоткея;
+    /// backspace снимает знак с конвертации.
+    #[test]
+    fn word_after_symbol_replaces_it() {
+        let mut p = pred(no_switch_cfg());
+        let mut now = t0();
+        p.feed_key(0x13, true, Layout::En, false, &StaticKeymap, now); // '@'
+        now += Duration::from_millis(50);
+        type_word(
+            &mut p,
+            "mail",
+            Layout::En,
+            &mut now,
+            Duration::from_millis(50),
+        );
+        // Недонабранное слово из буфера конвертируется как раньше,
+        // а не «@», стоящее перед ним.
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 4,
+                text: "ьфшд".into()
+            })
+        );
+
+        // «mail» зафиксировано пробелом — конвертируется слово, не «@».
+        now += Duration::from_millis(50);
+        p.feed_key(
+            crate::keymap::codes::SPACE,
+            false,
+            Layout::En,
+            false,
+            &StaticKeymap,
+            now,
+        );
+        assert_eq!(
+            p.convert_last_word(Layout::En),
+            Some(Conversion {
+                backspaces: 5,
+                text: "ьфшд ".into()
+            })
+        );
+
+        // Backspace после знака — конвертировать нечего.
+        let mut p2 = pred(no_switch_cfg());
+        let mut now2 = t0();
+        p2.feed_key(0x15, true, Layout::Ru, false, &StaticKeymap, now2); // ';'
+        now2 += Duration::from_millis(50);
+        p2.feed_key(
+            crate::keymap::codes::BACKSPACE,
+            false,
+            Layout::Ru,
+            false,
+            &StaticKeymap,
+            now2,
+        );
+        assert_eq!(p2.convert_last_word(Layout::Ru), None);
     }
 
     #[test]
