@@ -113,9 +113,10 @@ impl SuggestPanel {
         }
     }
 
-    /// Показывает панель у указателя мыши (правее-ниже курсора).
-    /// Только main-поток.
-    pub(crate) fn show(&mut self, labels: &[String]) {
+    /// Показывает панель в точке привязки `caret` `(x, y)` — левый нижний
+    /// угол каретки (координаты CG/AX). `None` — у указателя мыши
+    /// (правее-ниже курсора), как раньше. Только main-поток.
+    pub(crate) fn show(&mut self, labels: &[String], caret: Option<(f64, f64)>) {
         // Safety: работа с AppKit на main-потоке. Пул — как в new():
         // autoreleased NSString/шрифты не должны течь в headless-режиме.
         let _pool = AutoReleasePool::new();
@@ -123,12 +124,17 @@ impl SuggestPanel {
             self.rebuild_rows(labels);
             let height = ROW_H * labels.len().clamp(1, 9) as f64 + 2.0 * PAD;
 
-            // Позиция мыши в «экранных» координатах CG/AX (origin — левый
-            // верхний угол главного монитора). Не зависит от поддержки
-            // каретки приложением — работает в терминалах, играх и т.п.
-            let Some((mx, my)) = crate::macos::system::ax_mouse_location() else {
-                log::warn!("попап: позиция мыши недоступна");
-                return;
+            // Точка привязки в «экранных» координатах CG/AX (origin — левый
+            // верхний угол главного монитора): каретка, а без неё — мышь.
+            let (mx, my) = match caret {
+                Some(p) => p,
+                None => {
+                    let Some(p) = crate::macos::system::ax_mouse_location() else {
+                        log::warn!("попап: позиция каретки и мыши недоступна");
+                        return;
+                    };
+                    p
+                }
             };
 
             // Геометрия в координатах AX/CG: flip_h — высота ГЛАВНОГО
@@ -141,19 +147,24 @@ impl SuggestPanel {
                 return;
             };
 
-            // Под курсором (чуть правее-ниже); если не влезает — над ним;
-            // в любом случае не выходим за пределы дисплея с курсором.
+            // Под точкой привязки (чуть ниже); если не влезает — над ней;
+            // в любом случае не выходим за пределы дисплея с точкой.
             let mut top_quartz = my + GAP;
             if top_quartz + height > dy + dh - EDGE {
                 top_quartz = my - GAP - height;
             }
             top_quartz = top_quartz.clamp(dy, (dy + dh - height).max(dy));
-            let x = (mx + GAP).clamp(dx, (dx + dw - WIDTH).max(dx));
+            let x = mx.clamp(dx, (dx + dw - WIDTH).max(dx));
             // AX/CG считает y вниз от верхнего края — AppKit вверх от нижнего.
             let top_appkit = flip_h - top_quartz;
             let frame = rect(x, top_appkit - height, WIDTH, height);
+            let anchor_src = if caret.is_some() {
+                "каретка"
+            } else {
+                "мышь"
+            };
             log::debug!(
-                "попап: мышь=({mx:.0},{my:.0}) flip_h={flip_h:.0} \
+                "попап: привязка={anchor_src} ({mx:.0},{my:.0}) flip_h={flip_h:.0} \
                  дисплей=({dx:.0},{dy:.0} {dw:.0}x{dh:.0}) кадр=({:.0},{:.0}) размер={height:.0}",
                 frame.x,
                 frame.y

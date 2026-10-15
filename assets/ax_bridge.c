@@ -16,9 +16,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <math.h>
 
 /* Таймаут обмена сообщениями с AX, сек. Защита от зависания на «глухих» приложениях. */
 static const double kAXTimeout = 0.25;
+/* Таймаут запроса границ каретки: вызывается из конвейера печати,
+ * где каждая миллисекунда заметна, поэтому заметно короче основного. */
+static const double kCaretAXTimeout = 0.1;
 
 static char *cfstring_to_utf8_cstr(CFStringRef str) {
     if (str == NULL || CFGetTypeID(str) != CFStringGetTypeID()) {
@@ -132,6 +136,79 @@ char *ax_bridge_copy_selected_text(pid_t pid) {
     }
     CFRelease(textValue);
     return result;
+}
+
+/*
+ * Экранные границы каретки (или выделения) фокусного текстового элемента
+ * процесса pid: kAXSelectedTextRangeAttribute + kAXBoundsForRange.
+ * Координаты — «экранные» AX/CG (origin — левый верхний угол главного
+ * дисплея, y растёт вниз, единицы — поинты).
+ * Возвращает 1 и заполняет x/y/w/h, либо 0 (нет прав, приложение не
+ * поддерживает boundsForRange, таймаут).
+ */
+int ax_bridge_copy_caret_bounds(
+    pid_t pid,
+    double *out_x, double *out_y, double *out_w, double *out_h) {
+    if (out_x == NULL || out_y == NULL || out_w == NULL || out_h == NULL) {
+        return 0;
+    }
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (app == NULL) {
+        return 0;
+    }
+    AXUIElementSetMessagingTimeout(app, (Float32)kCaretAXTimeout);
+
+    /* Фокусный элемент сразу у приложения (фокусное окно не нужно). */
+    AXUIElementRef element = NULL;
+    AXError err = AXUIElementCopyAttributeValue(
+        app, kAXFocusedUIElementAttribute, (CFTypeRef *)&element);
+    CFRelease(app);
+    if (err != kAXErrorSuccess || element == NULL) {
+        return 0;
+    }
+
+    /* Диапазон каретки/выделения (AXValue типа Range). */
+    AXValueRef rangeValue = NULL;
+    err = AXUIElementCopyAttributeValue(
+        element, kAXSelectedTextRangeAttribute, (CFTypeRef *)&rangeValue);
+    if (err != kAXErrorSuccess || rangeValue == NULL ||
+        CFGetTypeID(rangeValue) != AXValueGetTypeID()) {
+        CFRelease(element);
+        return 0;
+    }
+    CFRange range = {0, 0};
+    Boolean ok = AXValueGetValue(rangeValue, kAXValueCFRangeType, &range);
+    if (!ok || range.location < 0 || range.length < 0) {
+        CFRelease(rangeValue);
+        CFRelease(element);
+        return 0;
+    }
+
+    /* Экранные границы диапазона (AXValue типа CGRect). */
+    AXValueRef boundsValue = NULL;
+    err = AXUIElementCopyParameterizedAttributeValue(
+        element, kAXBoundsForRangeParameterizedAttribute,
+        (CFTypeRef)rangeValue, (CFTypeRef *)&boundsValue);
+    CFRelease(rangeValue);
+    CFRelease(element);
+    if (err != kAXErrorSuccess || boundsValue == NULL) {
+        return 0;
+    }
+
+    CGRect rect = CGRectZero;
+    ok = AXValueGetValue(boundsValue, kAXValueCGRectType, &rect);
+    CFRelease(boundsValue);
+    /* У каретки ширина нулевая — проверяем только высоту и конечность. */
+    if (!ok || !isfinite(rect.origin.x) || !isfinite(rect.origin.y) ||
+        !isfinite(rect.size.width) || !isfinite(rect.size.height) ||
+        rect.size.height <= 0.0 || rect.size.width < 0.0) {
+        return 0;
+    }
+    *out_x = (double)rect.origin.x;
+    *out_y = (double)rect.origin.y;
+    *out_w = (double)rect.size.width;
+    *out_h = (double)rect.size.height;
+    return 1;
 }
 
 /*

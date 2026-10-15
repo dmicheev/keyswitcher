@@ -333,6 +333,14 @@ extern "C" {
     fn ax_bridge_copy_title(pid: i32) -> *const c_char;
     /// Выделенный текст фокусного элемента `pid` (malloc'ная UTF-8 строка) или NULL.
     fn ax_bridge_copy_selected_text(pid: i32) -> *const c_char;
+    /// Экранные границы каретки/выделения фокусного элемента `pid` или 0.
+    fn ax_bridge_copy_caret_bounds(
+        pid: i32,
+        out_x: *mut f64,
+        out_y: *mut f64,
+        out_w: *mut f64,
+        out_h: *mut f64,
+    ) -> i32;
     fn ax_bridge_free(ptr: *const c_char);
     /// Позиция указателя мыши в экранных координатах CG/AX.
     fn ax_bridge_mouse_location(out_x: *mut f64, out_y: *mut f64) -> i32;
@@ -372,6 +380,17 @@ pub(crate) fn ax_display_geometry(px: f64, py: f64) -> Option<(f64, f64, f64, f6
         ax_bridge_display_geometry(px, py, &mut flip_h, &mut dx, &mut dy, &mut dw, &mut dh)
     };
     (ok == 1).then_some((flip_h, dx, dy, dw, dh))
+}
+
+/// Границы каретки/выделения фокусного элемента `(x, y, w, h)` в «экранных»
+/// координатах CG/AX (origin — левый верхний угол главного монитора, y вниз;
+/// `y` — верх границы, низ = `y + h`). `None` — получить не удалось
+/// (нет разрешения, приложение не поддерживает boundsForRange, таймаут).
+pub(crate) fn ax_caret_bounds(pid: i64) -> Option<(f64, f64, f64, f64)> {
+    let (mut x, mut y, mut w, mut h) = (0f64, 0f64, 0f64, 0f64);
+    // Safety: C-функция только пишет в переданные указатели.
+    let ok = unsafe { ax_bridge_copy_caret_bounds(pid as i32, &mut x, &mut y, &mut w, &mut h) };
+    (ok == 1).then_some((x, y, w, h))
 }
 
 /// # Safety: указатель из ax_bridge_copy_title валиден до ax_bridge_free.

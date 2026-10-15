@@ -25,6 +25,7 @@
 //!   в «Универсальном доступе» режим печати включается без перезапуска;
 //! * приложения из `exclude_apps` и собственное окно настроек не трогаем.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, Hotkey, HotkeyMods};
@@ -36,7 +37,7 @@ use crate::macos::keymap::RuntimeKeymap;
 use crate::macos::pasteboard;
 use crate::macos::sound;
 use crate::macos::suggest_panel::SuggestPanel;
-use crate::macos::system::{ax_selected_text, MacSystem};
+use crate::macos::system::{ax_caret_bounds, ax_selected_text, MacSystem};
 use crate::predictor::{CommittedWord, Decision, Predictor, PredictorConfig};
 use crate::spell::{self, SpellConfig, SuggestionKind};
 
@@ -60,6 +61,10 @@ const CLIP_POLL_INTERVAL: f64 = 0.03;
 /// Задержка перед восстановлением буфера после Cmd+V (приложение читает
 /// буфер асинхронно — ранняя замена вставила бы старый текст).
 const CLIP_RESTORE_DELAY: Duration = Duration::from_millis(350);
+/// Неудачных попыток получить каретку на приложение, прежде чем перейти
+/// на постоянный фолбек «у мыши»: AX-запрос имеет таймаут 0.1 c, и на
+/// приложениях без поддержки boundsForRange не должен повторяться вечно.
+const CARET_MAX_FAILS: u8 = 2;
 
 /// Режим буферного конвейера конверации/подсказок для выделения.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -147,6 +152,9 @@ pub struct TypingPipeline {
     /// Кэш активного приложения из tick() — AX-вызовы в колбэке тапа
     /// запрещены (синхронный обмен с таймаутом 0.25 c тормозит печать).
     current_app: Option<(String, String)>,
+    /// Неудачные попытки получить границы каретки по ID приложения:
+    /// после `CARET_MAX_FAILS` попап всегда позиционируется у мыши.
+    caret_fails: HashMap<String, u8>,
     /// CGEventSource для наших пост-событий (CombinedSessionState).
     posting_source: ffi::CGEventSourceRef,
     /// Порт тапа (для ре-включения после DisabledByTimeout).
@@ -214,6 +222,7 @@ impl TypingPipeline {
             panel_shown_at: None,
             panel_app: None,
             current_app: None,
+            caret_fails: HashMap::new(),
             posting_source,
             tap_port: core::ptr::null_mut(),
             tap_source: core::ptr::null_mut(),
@@ -486,6 +495,35 @@ impl TypingPipeline {
         event
     }
 
+    /// Точка привязки попапа `(x, y)` — левый нижний угол каретки
+    /// (координаты CG/AX). `None` — каретка недоступна: лимит неудач
+    /// для приложения исчерпан либо AX не ответил (фолбек — позиция мыши).
+    ///
+    /// Проектное правило — «без AX в колбэке тапа» — здесь нарушается
+    /// осознанно: запрос уходит только при зафиксированном слове с
+    /// вариантами исправления (редкое событие), таймаут моста 0.1 c, а
+    /// после `CARET_MAX_FAILS` неудач приложение больше не опрашивается.
+    fn caret_anchor(&mut self) -> Option<(f64, f64)> {
+        let pid = self.system.frontmost_pid()?;
+        let key = self
+            .current_app
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| format!("pid:{pid}"));
+        if self.caret_fails.get(&key).copied().unwrap_or(0) >= CARET_MAX_FAILS {
+            return None;
+        }
+        match ax_caret_bounds(pid) {
+            Some((x, y, _w, h)) if h > 0.0 => Some((x, y + h)),
+            _ => {
+                let fails = self.caret_fails.entry(key).or_insert(0);
+                *fails += 1;
+                log::debug!("каретка: границы недоступны (попытка {fails}) — фолбек на мышь");
+                None
+            }
+        }
+    }
+
     /// Спеллчек зафиксированного слова и показ попапа при наличии вариантов.
     fn maybe_suggest(&mut self, word: &CommittedWord, current: Layout) {
         self.pending_fixes.clear();
@@ -526,7 +564,8 @@ impl TypingPipeline {
             .map(|(i, s)| format!("{}  {}", i + 1, s.text))
             .collect();
 
-        self.suggest_panel.show(&labels);
+        let anchor = self.caret_anchor();
+        self.suggest_panel.show(&labels, anchor);
         self.panel_visible = true;
         self.panel_shown_at = Some(Instant::now());
         self.panel_app = self.current_app.clone();
@@ -534,8 +573,13 @@ impl TypingPipeline {
             sound::play_suggest();
         }
         log::info!(
-            "Режим печати: попап подсказок (вариантов: {})",
-            labels.len()
+            "Режим печати: попап подсказок (вариантов: {}, привязка: {})",
+            labels.len(),
+            if anchor.is_some() {
+                "каретка"
+            } else {
+                "мышь"
+            }
         );
     }
 
@@ -946,13 +990,19 @@ impl TypingPipeline {
             .map(|(i, s)| format!("{}  {}", i + 1, s.text))
             .collect();
 
-        self.suggest_panel.show(&labels);
+        let anchor = self.caret_anchor();
+        self.suggest_panel.show(&labels, anchor);
         self.panel_visible = true;
         self.panel_shown_at = Some(Instant::now());
         self.panel_app = self.current_app.clone();
         log::info!(
-            "хоткей: варианты замены слова (вариантов: {})",
-            labels.len()
+            "хоткей: варианты замены слова (вариантов: {}, привязка: {})",
+            labels.len(),
+            if anchor.is_some() {
+                "каретка"
+            } else {
+                "мышь"
+            }
         );
         true
     }
